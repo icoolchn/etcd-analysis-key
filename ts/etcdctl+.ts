@@ -50,6 +50,17 @@ const completionSpec: Fig.Spec = {
             ],
         },
         {
+            name: ["decode"],
+            description: "decode the base64-encoded value",
+            options: [
+                {
+                    name: ["--value"],
+                    description: "the base64-encoded value",
+                    args: [{ name: "value" }],
+                },
+            ],
+        },
+        {
             name: ["distribute"],
             description: "Show the data distribution of etcd",
             options: [
@@ -149,6 +160,7 @@ const completionSpec: Fig.Spec = {
                         },
                     ],
                 },
+                { name: ["decode"], description: "decode the base64-encoded value" },
                 {
                     name: ["distribute"],
                     description: "Show the data distribution of etcd",
