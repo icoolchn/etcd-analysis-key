@@ -385,3 +385,57 @@ r.stats.countLock.Unlock()
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
 | `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性；`String()` data race 修复；`processResult` 字段级 race 修复 |
 | `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
+
+---
+
+## 测试体系
+
+参考 etcd 的 `tests/` 独立模块结构，建立分层测试架构。
+
+### 目录结构
+
+```
+tests/                              # 独立 Go 模块，replace 指向主模块
+├── go.mod
+├── common/helpers.go               # 共享测试工具：mock KV 生成、FeedAndRun、JSON 解析
+├── unit/report_api_test.go         # 导出 API 单元测试
+├── integration/distribute_test.go  # 集成测试 + 契约测试
+├── benchmark/report_bench_test.go  # 基准测试
+├── race/race_test.go               # 竞态检测（go test -race）
+├── regression/bugfix_test.go       # 回归测试（覆盖 BUGFIX 10 项修复）
+└── stress/stress_test.go           # 压力测试
+core/
+└── report_test.go                  # 内部单元测试（可访问未导出类型）
+```
+
+### 测试覆盖汇总
+
+| 测试文件 | 测试数 | 类型 | 说明 |
+|---------|-------|------|------|
+| `core/report_test.go` | 10 | 单元 | 内部字段、sort、锁、空数据、JSON |
+| `tests/unit/` | 3 | 单元 | NewReport 导出 API |
+| `tests/integration/` | 5 | 集成+契约 | 完整管道、JSON schema |
+| `tests/benchmark/` | 4 | 基准 | 吞吐量、JSON 输出耗时 |
+| `tests/race/` | 3 | 竞态 | 多 goroutine + DynamicOutput |
+| `tests/regression/` | 7 | 回归 | CR-Fix 1~10 各项修复 |
+| `tests/stress/` | 3 | 压力 | 10K key、100 批并发、大值 |
+| **合计** | **35** | | |
+
+### 运行命令
+
+```bash
+# 内部单元测试
+go test -v ./core/
+
+# tests/ 模块全部测试
+cd tests && go test -v ./...
+
+# 竞态检测
+cd tests && go test -race -v ./race/ ./regression/
+
+# 基准测试
+cd tests && go test -bench=. -benchmem ./benchmark/
+
+# 压力测试
+cd tests && go test -v -timeout 60s ./stress/
+```
