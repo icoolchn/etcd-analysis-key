@@ -232,7 +232,7 @@ func NewReport(bc int, of SizeOf, opts ...ReportOption) Report {
 type ReportJSON struct {
 	Summary     SummaryJSON    `json:"summary"`
 	Histogram   []BucketJSON   `json:"histogram"`
-	Percentiles map[string]int `json:"percentiles"`
+	Percentiles map[string]int `json:"percentiles_bytes"`
 }
 
 type SummaryJSON struct {
@@ -328,7 +328,7 @@ func (r *report) percentilesJSON() map[string]int {
 	data := percentiles(r.stats.sizes, r.stats.sizeToCount)
 	for i, p := range pctls {
 		if i < len(data) {
-			key := fmt.Sprintf("p%d", int(p))
+			key := fmt.Sprintf("p%d_bytes", int(p))
 			result[key] = data[i]
 		}
 	}
