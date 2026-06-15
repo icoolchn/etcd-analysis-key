@@ -83,7 +83,9 @@ func (r *report) processResults() {
 		r.processResult(res)
 	}
 	r.processOver.Store(true)
-	time.Sleep(time.Millisecond * 100)
+	if !r.jsonMode {
+		time.Sleep(time.Millisecond * 100)
+	}
 }
 
 func (r *report) processResult(res []*mvccpb.KeyValue) {
@@ -195,11 +197,17 @@ func (r *report) histogram() string {
 	return buffer.String()
 }
 
-func NewReport(bc int, of SizeOf, jsonMode ...bool) Report {
-	isJSON := false
-	if len(jsonMode) > 0 && jsonMode[0] {
-		isJSON = true
+// ReportOption is a functional option for configuring a report.
+type ReportOption func(*report)
+
+// WithJSONMode enables JSON output mode (no dynamic terminal output).
+func WithJSONMode() ReportOption {
+	return func(r *report) {
+		r.jsonMode = true
 	}
+}
+
+func NewReport(bc int, of SizeOf, opts ...ReportOption) Report {
 	r := &report{
 		results: make(chan []*mvccpb.KeyValue),
 		stats: Stats{
@@ -210,7 +218,9 @@ func NewReport(bc int, of SizeOf, jsonMode ...bool) Report {
 		bucketCount: bc,
 		sizeOf:      of,
 		writer:      uilive.New(),
-		jsonMode:    isJSON,
+	}
+	for _, opt := range opts {
+		opt(r)
 	}
 	r.processOver.Store(false)
 
@@ -220,9 +230,9 @@ func NewReport(bc int, of SizeOf, jsonMode ...bool) Report {
 // JSON output structures
 
 type ReportJSON struct {
-	Summary    SummaryJSON           `json:"summary"`
-	Histogram  []BucketJSON          `json:"histogram"`
-	Percentiles map[string]int       `json:"percentiles"`
+	Summary     SummaryJSON    `json:"summary"`
+	Histogram   []BucketJSON   `json:"histogram"`
+	Percentiles map[string]int `json:"percentiles"`
 }
 
 type SummaryJSON struct {
@@ -240,6 +250,18 @@ type BucketJSON struct {
 }
 
 func (r *report) JSON() string {
+	if r.stats.Count <= 0 {
+		empty := ReportJSON{
+			Summary:     SummaryJSON{},
+			Histogram:   []BucketJSON{},
+			Percentiles: map[string]int{},
+		}
+		data, _ := json.MarshalIndent(empty, "", "  ")
+		return string(data)
+	}
+
+	sort.Ints(r.stats.sizes)
+
 	summary := SummaryJSON{
 		Count:         r.stats.Count,
 		TotalBytes:    r.stats.Total,
@@ -248,10 +270,7 @@ func (r *report) JSON() string {
 		AverageBytes:  r.stats.Average,
 	}
 
-	// histogram buckets
 	histogram := r.histogramJSON()
-
-	// percentiles
 	percentiles := r.percentilesJSON()
 
 	report := ReportJSON{
@@ -306,7 +325,6 @@ func (r *report) histogramJSON() []BucketJSON {
 
 func (r *report) percentilesJSON() map[string]int {
 	result := make(map[string]int)
-	sort.Ints(r.stats.sizes)
 	data := percentiles(r.stats.sizes, r.stats.sizeToCount)
 	for i, p := range pctls {
 		if i < len(data) {

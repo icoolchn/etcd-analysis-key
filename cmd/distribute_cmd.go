@@ -45,7 +45,7 @@ Summary:
 Size histogram:
   0.0 B [12]    |∎
   573.0 B [275] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  1.1 KB [80]   |∎∎∎∎∎∎∎∎∎∎∎
+  1.1 KB [80]   |∎∎∎∎∎∎∎∎∎∎
   1.7 KB [0]    |
   2.2 KB [0]    |
   2.8 KB [0]    |
@@ -96,31 +96,31 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	if distributeWriteOut == "json" {
-		// JSON mode: no dynamic output, collect stats then print JSON
-		r := core.NewReport(bucketCount, sizeOf, true)
-		c1 := r.Results()
-		go func() {
-			defer close(c1)
-			for data := range datac {
-				c1 <- data
-			}
-		}()
-		<-r.Run()
-		fmt.Println(r.JSON())
+	isJSON := distributeWriteOut == "json"
+
+	// Build report with appropriate options
+	var r core.Report
+	if isJSON {
+		r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
 	} else {
-		// Text mode: original behavior with dynamic terminal output
-		r := core.NewReport(bucketCount, sizeOf)
-		c1 := r.Results()
-		go func() {
-			defer close(c1)
-			if len(datac) > 0 {
-				r.DynamicOutput()
-			}
-			for data := range datac {
-				c1 <- data
-			}
-		}()
-		<-r.Run()
+		r = core.NewReport(bucketCount, sizeOf)
+	}
+
+	// Common data pipeline
+	c1 := r.Results()
+	go func() {
+		defer close(c1)
+		if !isJSON && len(datac) > 0 {
+			r.DynamicOutput()
+		}
+		for data := range datac {
+			c1 <- data
+		}
+	}()
+	<-r.Run()
+
+	// Output
+	if isJSON {
+		fmt.Println(r.JSON())
 	}
 }
