@@ -35,10 +35,11 @@ func init() {
 	rootCmd.AddCommand(NewDistributeCmd())
 	rootCmd.AddCommand(NewLookCmd())
 	rootCmd.AddCommand(NewLeaderCmd())
-	rootCmd.AddCommand(NewClearCmd())
+	// Disabled: high-risk commands that modify/delete etcd data
+	// rootCmd.AddCommand(NewClearCmd())   // 🔴 deletes ALL etcd data, irreversible
 	rootCmd.AddCommand(NewFindCmd())
 	rootCmd.AddCommand(NewDecodeCmd())
-	rootCmd.AddCommand(NewRenameCmd())
+	// rootCmd.AddCommand(NewRenameCmd())  // 🟠 non-atomic Get→Put→Delete, may cause inconsistency
 	rootCmd.AddCommand(NewUnmarshalCmd())
 	rootCmd.AddCommand(cobracompletefig.CreateCompletionSpecCommand())
 }
