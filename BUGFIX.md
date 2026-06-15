@@ -309,6 +309,36 @@ r.stats.countLock.RUnlock()
 
 ---
 
+### CR-Fix 9: `String()` 中 `sort.Ints` data race
+
+**问题**
+
+`DynamicOutput()` 每 100ms 调用 `dynamicString()` → `String()` → `sort.Ints(r.stats.sizes)`，而 `processResult()` 同时在 `append(sizes, s)`。`sort.Ints` 是原地写操作，未持锁，与 `append` 构成 data race。`append` 扩容时可能导致 `sort` 读取到不一致的 slice header，引发 panic。
+
+**修复**
+
+在 `String()` 中将 `sort.Ints` + `histogram()` + `PrintPercent()` 整体用 `countLock.Lock()`/`Unlock()` 保护，同时移除 `histogram()` 内部冗余的 per-element 锁（调用方已持锁）：
+
+```go
+// 修复前
+sort.Ints(r.stats.sizes)                    // ← 无锁，与 append 并发
+buffer.WriteString(r.histogram())           // ← histogram 内部有 per-element RLock
+r.stats.countLock.RLock()
+buffer.WriteString(PrintPercent(...))
+r.stats.countLock.RUnlock()
+
+// 修复后
+r.stats.countLock.Lock()                    // ← 写锁保护整个读-改序列
+sort.Ints(r.stats.sizes)
+buffer.WriteString(r.histogram())
+buffer.WriteString(PrintPercent(...))
+r.stats.countLock.Unlock()
+```
+
+**修改文件：** `core/report.go`
+
+---
+
 ## 修复状态汇总
 
 | # | 问题 | 严重程度 | 状态 |
@@ -321,9 +351,10 @@ r.stats.countLock.RUnlock()
 | 6 | `go.sum` 残留旧版本哈希 | 🟢 低 | ✅ CR-Fix 6 |
 | 7 | `Percentiles` 值类型为 `int`，单位不明确 | 🟢 低 | ✅ CR-Fix 7 |
 | 8 | `countLock` 保护不一致 | 🟡 中 | ✅ CR-Fix 8 |
-| 9 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
-| 10 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
-| 11 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
+| 9 | `String()` 中 `sort.Ints` data race | 🔴 高 | ✅ CR-Fix 9 |
+| 10 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
+| 11 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
+| 12 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
 
 ---
 
@@ -336,5 +367,5 @@ r.stats.countLock.RUnlock()
 | `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 | `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
-| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性 |
+| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性；`String()` data race 修复 |
 | `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
