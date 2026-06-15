@@ -154,6 +154,9 @@ Kv List
 
 Get key based on certain characters
 
+> **Note:** The `--key` flag has been renamed to `--match-key` to avoid collision with the global TLS `--key` flag.  
+> If you previously used `etcdctl+ find --key=xxx`, use `etcdctl+ find --match-key=xxx` instead.
+
 ```shell
 $ etcdctl+ find --match-key=index
 Kv List
@@ -194,6 +197,9 @@ ClientUrls: [http://127.0.0.1:2379]
 ### unmarshal
 
 Implement proto.Unmarshal byte array through proto source file.
+
+> **Note:** The `--key` flag has been renamed to `--target-key` to avoid collision with the global TLS `--key` flag.  
+> If you previously used `etcdctl+ unmarshal --key=xxx`, use `etcdctl+ unmarshal --target-key=xxx` instead.
 
 Generally speaking, we store some system meta information in etcd, and the stored pseudocode is:
 
