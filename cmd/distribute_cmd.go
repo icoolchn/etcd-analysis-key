@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/SimFG/etcd-analysis/core"
 	"github.com/spf13/cobra"
@@ -9,8 +10,9 @@ import (
 )
 
 var (
-	distributeType string
-	bucketCount    int
+	distributeType     string
+	bucketCount        int
+	distributeWriteOut string
 )
 
 func NewDistributeCmd() *cobra.Command {
@@ -65,6 +67,11 @@ Size distribution:
 
 	cmd.Flags().StringVar(&distributeType, "type", "key", "Distribution basis; key, value or kv")
 	cmd.Flags().IntVar(&bucketCount, "bucket", 5, "Bucket Count")
+	cmd.Flags().StringVar(&distributeWriteOut, "write-out", "text", "Output format: text or json")
+
+	cmd.RegisterFlagCompletionFunc("write-out", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+		return []string{"text", "json"}, cobra.ShellCompDirectiveDefault
+	})
 
 	cmd.RegisterFlagCompletionFunc("type", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		return []string{"key", "value", "kv"}, cobra.ShellCompDirectiveDefault
@@ -88,16 +95,32 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 			return binary.Size(kv.Key)
 		}
 	}
-	r := core.NewReport(bucketCount, sizeOf)
-	c1 := r.Results()
-	go func() {
-		defer close(c1)
-		if len(datac) > 0 {
-			r.DynamicOutput()
-		}
-		for data := range datac {
-			c1 <- data
-		}
-	}()
-	<-r.Run()
+
+	if distributeWriteOut == "json" {
+		// JSON mode: no dynamic output, collect stats then print JSON
+		r := core.NewReport(bucketCount, sizeOf, true)
+		c1 := r.Results()
+		go func() {
+			defer close(c1)
+			for data := range datac {
+				c1 <- data
+			}
+		}()
+		<-r.Run()
+		fmt.Println(r.JSON())
+	} else {
+		// Text mode: original behavior with dynamic terminal output
+		r := core.NewReport(bucketCount, sizeOf)
+		c1 := r.Results()
+		go func() {
+			defer close(c1)
+			if len(datac) > 0 {
+				r.DynamicOutput()
+			}
+			for data := range datac {
+				c1 <- data
+			}
+		}()
+		<-r.Run()
+	}
 }
