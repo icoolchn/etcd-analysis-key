@@ -267,6 +267,28 @@ if isJSON {
 
 ---
 
+### CR-Fix 7: `ReportJSON.Percentiles` 值类型为 `int`，单位不明确
+
+**问题**
+
+百分位值输出为纯数字 `"p50": 424`，不知道单位是字节还是其他。text 模式有可读的 `424.0 Byte`，JSON 模式缺少单位信息。
+
+**修复**
+
+将 JSON tag 从 `percentiles` 改为 `percentiles_bytes`，key 名从 `p50` 改为 `p50_bytes`，显式表达“字节”单位，同时保持 `int` 类型以便机器解析：
+
+```json
+// 修复前
+"percentiles": { "p50": 424 }
+
+// 修复后
+"percentiles_bytes": { "p50_bytes": 424 }
+```
+
+**修改文件：** `core/report.go`
+
+---
+
 ## 修改文件汇总
 
 | 文件 | 修改内容 |
@@ -276,5 +298,5 @@ if isJSON {
 | `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 | `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
-| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep |
+| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化 |
 | `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
