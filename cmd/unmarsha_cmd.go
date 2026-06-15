@@ -26,7 +26,7 @@ func NewUnmarshalCmd() *cobra.Command {
 		Run:   unmarshalFunc,
 	}
 
-	cmd.Flags().StringVar(&unmarshallKey, "key", "", "the proto.marshal value of the full key")
+	cmd.Flags().StringVar(&unmarshallKey, "target-key", "", "the target key of the etcd data")
 	cmd.Flags().StringArrayVar(&unmarshalImportPaths, "import-path", []string{}, "the proto.marshal value of the full key")
 	cmd.Flags().StringArrayVar(&unmarshalFileNames, "proto", []string{}, "the proto.marshal value of the full key")
 	cmd.Flags().StringVar(&unmarshalFullMessageName, "full-message-name", "", "the proto.marshal value of the full key")

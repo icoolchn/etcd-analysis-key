@@ -28,7 +28,7 @@ func NewFindCmd() *cobra.Command {
 		Run:   findFunc,
 	}
 
-	cmd.Flags().StringVar(&findKey, "key", "", "Show the data like the key")
+	cmd.Flags().StringVar(&findKey, "match-key", "", "Show the data like the match key")
 	cmd.Flags().StringVar(&findPrefix, "prefix", "", "Show the data like the prefix")
 	cmd.Flags().BoolVar(&containValue, "value", false, "Show the value or not")
 	cmd.Flags().IntVar(&findLimit, "limit", 10, "The limit of the show keys")
