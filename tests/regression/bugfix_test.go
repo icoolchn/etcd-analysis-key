@@ -10,7 +10,7 @@ import (
 	"github.com/SimFG/etcd-analysis/tests/common"
 )
 
-// --- Regression Tests for BUGFIX.md ---
+// --- Regression Tests for CHANGELOG.md ---
 
 // CR-Fix 1: histogramJSON sort correctness
 func TestRegression_CR1_HistogramSortedBeforeBucketing(t *testing.T) {
