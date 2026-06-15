@@ -93,21 +93,21 @@ func (r *report) processResult(res []*mvccpb.KeyValue) {
 	if l == 0 {
 		return
 	}
+	r.stats.countLock.Lock()
 	r.stats.Count += l
 	for _, kv := range res {
 		s := r.sizeOf(kv)
 		r.stats.Smallest = Min(r.stats.Smallest, s)
 		r.stats.Largest = Max(r.stats.Largest, s)
 		r.stats.Total += s
-		r.stats.countLock.Lock()
 		_, ok := r.stats.sizeToCount[s]
 		if !ok {
 			r.stats.sizes = append(r.stats.sizes, s)
 		}
 		r.stats.sizeToCount[s] += 1
-		r.stats.countLock.Unlock()
 	}
 	r.stats.Average = r.stats.Total / r.stats.Count
+	r.stats.countLock.Unlock()
 }
 
 func (r *report) String() string {
@@ -144,7 +144,10 @@ func (r *report) DynamicOutput() {
 }
 
 func (r *report) dynamicString() {
-	if r.stats.Count <= 0 {
+	r.stats.countLock.RLock()
+	count := r.stats.Count
+	r.stats.countLock.RUnlock()
+	if count <= 0 {
 		return
 	}
 
@@ -153,7 +156,10 @@ func (r *report) dynamicString() {
 }
 
 func (r *report) finalString() {
-	if r.stats.Count <= 0 {
+	r.stats.countLock.RLock()
+	count := r.stats.Count
+	r.stats.countLock.RUnlock()
+	if count <= 0 {
 		return
 	}
 

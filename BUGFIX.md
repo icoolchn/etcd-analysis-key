@@ -339,6 +339,21 @@ r.stats.countLock.Unlock()
 
 ---
 
+### CR-Fix 10: `processResult` 字段级 data race（race detector 发现）
+
+**问题**
+
+`go test -race` 发现 `processResult()` 写入 `r.stats.Count`/`Smallest`/`Largest`/`Total`/`Average` 时未持锁，而 `dynamicString()` 和 `finalString()` 并发读取这些字段，构成 data race。
+
+**修复**
+
+1. `processResult()`: 将所有统计字段写入整体包裹在 `countLock.Lock()/Unlock()` 中（替代原来的 per-element 锁）
+2. `dynamicString()` / `finalString()`: 用 `countLock.RLock()` 保护 `Count` 读取
+
+**修改文件：** `core/report.go`
+
+---
+
 ## 修复状态汇总
 
 | # | 问题 | 严重程度 | 状态 |
@@ -352,9 +367,10 @@ r.stats.countLock.Unlock()
 | 7 | `Percentiles` 值类型为 `int`，单位不明确 | 🟢 低 | ✅ CR-Fix 7 |
 | 8 | `countLock` 保护不一致 | 🟡 中 | ✅ CR-Fix 8 |
 | 9 | `String()` 中 `sort.Ints` data race | 🔴 高 | ✅ CR-Fix 9 |
-| 10 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
-| 11 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
-| 12 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
+| 10 | `processResult` 字段级 data race | 🔴 高 | ✅ CR-Fix 10 |
+| 11 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
+| 12 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
+| 13 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
 
 ---
 
@@ -367,5 +383,5 @@ r.stats.countLock.Unlock()
 | `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 | `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
-| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性；`String()` data race 修复 |
+| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性；`String()` data race 修复；`processResult` 字段级 race 修复 |
 | `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
