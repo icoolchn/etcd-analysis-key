@@ -116,12 +116,165 @@ etcdctl+ unmarshal --target-key=/registry/pods/default/my-pod ...
 
 ---
 
+## Code Review 修复 (2026-06-12)
+
+> 基于对 `d89a6ea` (bugfix) 和 `1f1cc55` (feat) 两个提交的 Code Review，融合多份审查意见后执行以下修复。
+
+---
+
+### CR-Fix 1: `histogramJSON()` 分桶结果错误（严重）
+
+**问题**
+
+`JSON()` 方法的调用顺序：先 `histogramJSON()` 后 `percentilesJSON()`。`histogramJSON()` 的双指针分桶算法依赖 `r.stats.sizes` 已排序（指针 `bi` 只能单向前进），但此时 `sizes` 尚未排序。text 模式 `String()` 会先调用 `sort.Ints` 再调 `histogram()`，是正确的；JSON 模式顺序反了。
+
+**修复**
+
+在 `JSON()` 方法开头加入 `sort.Ints(r.stats.sizes)`，同时移除 `percentilesJSON()` 内的冗余排序。
+
+**修改文件：** `core/report.go`
+
+---
+
+### CR-Fix 2: JSON 模式空数据暴露哨兵值
+
+**问题**
+
+`Count == 0` 时，`Smallest` 保持初始哨兵值 `math.MaxInt32`，`Largest` 保持 `-1`。text 模式有空数据保护（输出 `"empty data"` 并跳过 `finalString()`），但 JSON 模式会直接输出无意义的哨兵值。
+
+**修复**
+
+`JSON()` 开头增加空数据检查，返回合理的零值结构体：
+
+```go
+if r.stats.Count <= 0 {
+    empty := ReportJSON{
+        Summary:     SummaryJSON{},
+        Histogram:   []BucketJSON{},
+        Percentiles: map[string]int{},
+    }
+    data, _ := json.MarshalIndent(empty, "", "  ")
+    return string(data)
+}
+```
+
+**修改文件：** `core/report.go`
+
+---
+
+### CR-Fix 3: `NewReport` variadic bool → Functional Options
+
+**问题**
+
+`NewReport(bc, of, true)` 中 `true` 的含义对调用方不透明，API 设计不清晰。
+
+**修复**
+
+引入 Functional Options 模式：
+
+```go
+// ReportOption is a functional option for configuring a report.
+type ReportOption func(*report)
+
+// WithJSONMode enables JSON output mode (no dynamic terminal output).
+func WithJSONMode() ReportOption { ... }
+
+func NewReport(bc int, of SizeOf, opts ...ReportOption) Report { ... }
+```
+
+调用方代码变为：
+
+```go
+// JSON 模式
+r := core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
+
+// Text 模式（默认）
+r := core.NewReport(bucketCount, sizeOf)
+```
+
+**修改文件：** `core/report.go`、`cmd/distribute_cmd.go`
+
+---
+
+### CR-Fix 4: JSON 模式下 `processResults` 无意义 sleep
+
+**问题**
+
+`processResults()` 末尾固定 `time.Sleep(100ms)` 是为了等待 text 模式的 dynamic output 刷新。JSON 模式不需要 dynamic output，这个 sleep 纯属浪费时间。
+
+**修复**
+
+改为条件执行：
+
+```go
+if !r.jsonMode {
+    time.Sleep(time.Millisecond * 100)
+}
+```
+
+**修改文件：** `core/report.go`
+
+---
+
+### CR-Fix 5: `distribute_cmd.go` text/json 分支代码复用
+
+**问题**
+
+text 和 json 两个分支除了 `DynamicOutput()` 和最终输出方式不同外，数据管道逻辑完全重复。
+
+**修复**
+
+提取公共数据管道逻辑，仅在构建 Report 和最终输出处分叉：
+
+```go
+isJSON := distributeWriteOut == "json"
+var r core.Report
+if isJSON {
+    r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
+} else {
+    r = core.NewReport(bucketCount, sizeOf)
+}
+// 公共数据管道
+c1 := r.Results()
+go func() {
+    defer close(c1)
+    if !isJSON && len(datac) > 0 {
+        r.DynamicOutput()
+    }
+    for data := range datac { c1 <- data }
+}()
+<-r.Run()
+if isJSON {
+    fmt.Println(r.JSON())
+}
+```
+
+**修改文件：** `cmd/distribute_cmd.go`
+
+---
+
+### CR-Fix 6: `go.sum` 残留旧版本哈希
+
+**问题**
+
+升级 etcd client 后 `go.sum` 中同时保留了 v3.5.0 和 v3.5.27 两套哈希。
+
+**修复**
+
+执行 `go mod tidy`，清理 219 行残留旧哈希。
+
+**修改文件：** `go.sum`
+
+---
+
 ## 修改文件汇总
 
 | 文件 | 修改内容 |
-|------|---------|
+|------|--------|
 | `cmd/root_cmd.go` | 禁用 clear 和 rename 命令 |
 | `cmd/find_cmd.go` | `--key` → `--match-key` |
 | `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 | `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
-| `go.sum` | 依赖校验和更新 |
+| `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
+| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep |
+| `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
