@@ -1,8 +1,14 @@
-# Bugfix Changelog
+# Changelog
 
-## Bugfix 1: etcd client v3.5.0 `WithPrefix` 误判导致 panic
+---
 
-### 现象
+## 阶段一：初始修复
+
+> 提交 `d89a6ea` — 修复 `WithPrefix` panic、flag 冲突、禁用高危命令。
+
+### Fix 1: etcd client v3.5.0 `WithPrefix` 误判导致 panic
+
+**现象**
 
 执行 `distribute`、`look`、`find`（无 prefix）命令时触发 panic：
 
@@ -10,11 +16,11 @@
 panic: `WithPrefix` and `WithFromKey` cannot be set at the same time, choose one
 ```
 
-### 根因
+**根因**
 
 etcd client v3.5.0 使用反射 + `strings.Contains` 检测 option 类型。项目代码中 `GetDataWithPrefix` 函数名包含 `WithPrefix`，导致该函数内所有闭包名（如 `WithFromKey`、`WithSerializable`、`WithLimit`）都被误判为 `WithPrefix`，触发冲突检测。
 
-### 修复
+**修复**
 
 升级 etcd client 从 v3.5.0 到 v3.5.27。v3.5.15+ 改为在闭包内部直接设置 bool 标记，不再依赖反射和字符串匹配。
 
@@ -29,9 +35,9 @@ go directive                   1.18   → 1.24
 
 ---
 
-## Bugfix 2: `--key` Flag 冲突导致 TLS 连接失败
+### Fix 2: `--key` Flag 冲突导致 TLS 连接失败
 
-### 现象
+**现象**
 
 使用 TLS 连接 etcd 时，`find --key=xxx` 和 `unmarshal --key=xxx` 报 TLS 握手失败：
 
@@ -41,7 +47,7 @@ tls: failed to verify certificate: x509: "etcd" certificate is not standards com
 
 而 `leader`、`distribute`、`look` 等命令 TLS 连接正常。
 
-### 根因
+**根因**
 
 全局 PersistentFlag `--key`（TLS 私钥文件）与 find/unmarshal 子命令 LocalFlag `--key`（搜索关键字/etcd key）同名。Cobra 子命令 LocalFlag 会覆盖 PersistentFlag，导致 TLS 私钥路径被覆盖为搜索关键字字符串，证书加载失败。
 
@@ -54,17 +60,17 @@ cmd.Flags().StringVar(&findKey, "key", "", "搜索关键字")
 cmd.Flags().StringVar(&unmarshallKey, "key", "", "etcd key")
 ```
 
-### 触发条件
+**触发条件**
 
 必须同时满足：1) 使用 TLS 连接；2) 子命令使用了 `--key`
 
 | 场景 | 结果 |
 |------|------|
-| 不连 TLS + `find --key=qa` | ✅ 正常（全局 --key 为空，覆盖无影响） |
-| 连 TLS + `find`（不用 --key） | ✅ 正常（全局 --key 不被覆盖） |
-| 连 TLS + `find --key=qa` | ❌ TLS 私钥被覆盖为 "qa"，握手失败 |
+| 不连 TLS + `find --key=qa` | 正常（全局 --key 为空，覆盖无影响） |
+| 连 TLS + `find`（不用 --key） | 正常（全局 --key 不被覆盖） |
+| 连 TLS + `find --key=qa` | TLS 私钥被覆盖为 "qa"，握手失败 |
 
-### 修复
+**修复**
 
 将子命令 `--key` 重命名，避免与全局 TLS `--key` 冲突。
 
@@ -77,48 +83,32 @@ cmd.Flags().StringVar(&unmarshallKey, "key", "", "etcd key")
 
 **修改文件：** `cmd/find_cmd.go`、`cmd/unmarsha_cmd.go`
 
-**使用方式变化：**
-
-```bash
-# 修改前
-etcdctl+ find --key=qa
-etcdctl+ unmarshal --key=/registry/pods/default/my-pod ...
-
-# 修改后
-etcdctl+ find --match-key=qa
-etcdctl+ unmarshal --target-key=/registry/pods/default/my-pod ...
-```
-
 ---
 
-## Bugfix 3: 禁用高危命令
+### Fix 3: 禁用高危命令
 
-### 原因
+**原因**
 
 `clear` 和 `rename` 命令存在数据安全风险：
 
 | 命令 | 风险等级 | 风险说明 |
 |------|---------|---------|
-| clear | 🔴 极高 | 删除 etcd 全部数据，不可逆 |
-| rename | 🟠 高 | 非原子 Get→Put→Delete，中途失败导致数据不一致 |
+| clear | 极高 | 删除 etcd 全部数据，不可逆 |
+| rename | 高 | 非原子 Get->Put->Delete，中途失败导致数据不一致 |
 
-### 修复
+**修复**
 
 注释掉 `root_cmd.go` 中 `NewClearCmd()` 和 `NewRenameCmd()` 的注册。源码保留，取消注释即可重新启用。
 
 **修改文件：** `cmd/root_cmd.go`
 
-```go
-// Disabled: high-risk commands that modify/delete etcd data
-// rootCmd.AddCommand(NewClearCmd())   // 🔴 deletes ALL etcd data, irreversible
-// rootCmd.AddCommand(NewRenameCmd())  // 🟠 non-atomic Get→Put→Delete, may cause inconsistency
-```
-
 ---
 
-## Code Review 修复 (2026-06-12)
+## 阶段二：JSON 输出功能
 
-> 基于对 `d89a6ea` (bugfix) 和 `1f1cc55` (feat) 两个提交的 Code Review，融合多份审查意见后执行以下修复。
+> 提交 `1f1cc55` (feat) — distribute 命令新增 `--write-out=json` 支持，可通过 `--write-out=json` 输出机器可读的 JSON 格式报告，便于脚本解析和自动化处理。
+>
+> 提交 `fce35f0`~`0481267` (fix/test) — 基于对以上两个提交的 Code Review，融合多份审查意见后执行以下修复，并建立完整测试体系。
 
 ---
 
@@ -162,7 +152,7 @@ if r.stats.Count <= 0 {
 
 ---
 
-### CR-Fix 3: `NewReport` variadic bool → Functional Options
+### CR-Fix 3: `NewReport` variadic bool -> Functional Options
 
 **问题**
 
@@ -173,10 +163,8 @@ if r.stats.Count <= 0 {
 引入 Functional Options 模式：
 
 ```go
-// ReportOption is a functional option for configuring a report.
 type ReportOption func(*report)
 
-// WithJSONMode enables JSON output mode (no dynamic terminal output).
 func WithJSONMode() ReportOption { ... }
 
 func NewReport(bc int, of SizeOf, opts ...ReportOption) Report { ... }
@@ -267,7 +255,7 @@ if isJSON {
 
 ---
 
-### CR-Fix 7: `ReportJSON.Percentiles` 值类型为 `int`，单位不明确
+### CR-Fix 7: `ReportJSON.Percentiles` 值单位不明确
 
 **问题**
 
@@ -275,7 +263,7 @@ if isJSON {
 
 **修复**
 
-将 JSON tag 从 `percentiles` 改为 `percentiles_bytes`，key 名从 `p50` 改为 `p50_bytes`，显式表达“字节”单位，同时保持 `int` 类型以便机器解析：
+将 JSON tag 从 `percentiles` 改为 `percentiles_bytes`，key 名从 `p50` 改为 `p50_bytes`，显式表达"字节"单位：
 
 ```json
 // 修复前
@@ -297,13 +285,7 @@ if isJSON {
 
 **修复**
 
-在 `percentilesJSON()` 中加 `countLock.RLock()/RUnlock()`，与 `String()` 保持一致：
-
-```go
-r.stats.countLock.RLock()
-data := percentiles(r.stats.sizes, r.stats.sizeToCount)
-r.stats.countLock.RUnlock()
-```
+在 `percentilesJSON()` 中加 `countLock.RLock()/RUnlock()`，与 `String()` 保持一致。
 
 **修改文件：** `core/report.go`
 
@@ -313,22 +295,14 @@ r.stats.countLock.RUnlock()
 
 **问题**
 
-`DynamicOutput()` 每 100ms 调用 `dynamicString()` → `String()` → `sort.Ints(r.stats.sizes)`，而 `processResult()` 同时在 `append(sizes, s)`。`sort.Ints` 是原地写操作，未持锁，与 `append` 构成 data race。`append` 扩容时可能导致 `sort` 读取到不一致的 slice header，引发 panic。
+`DynamicOutput()` 每 100ms 调用 `dynamicString()` -> `String()` -> `sort.Ints(r.stats.sizes)`，而 `processResult()` 同时在 `append(sizes, s)`。`sort.Ints` 是原地写操作，未持锁，与 `append` 构成 data race。`append` 扩容时可能导致 `sort` 读取到不一致的 slice header，引发 panic。
 
 **修复**
 
-在 `String()` 中将 `sort.Ints` + `histogram()` + `PrintPercent()` 整体用 `countLock.Lock()`/`Unlock()` 保护，同时移除 `histogram()` 内部冗余的 per-element 锁（调用方已持锁）：
+在 `String()` 中将 `sort.Ints` + `histogram()` + `PrintPercent()` 整体用 `countLock.Lock()`/`Unlock()` 保护，同时移除 `histogram()` 内部冗余的 per-element 锁：
 
 ```go
-// 修复前
-sort.Ints(r.stats.sizes)                    // ← 无锁，与 append 并发
-buffer.WriteString(r.histogram())           // ← histogram 内部有 per-element RLock
-r.stats.countLock.RLock()
-buffer.WriteString(PrintPercent(...))
-r.stats.countLock.RUnlock()
-
-// 修复后
-r.stats.countLock.Lock()                    // ← 写锁保护整个读-改序列
+r.stats.countLock.Lock()
 sort.Ints(r.stats.sizes)
 buffer.WriteString(r.histogram())
 buffer.WriteString(PrintPercent(...))
@@ -339,7 +313,7 @@ r.stats.countLock.Unlock()
 
 ---
 
-### CR-Fix 10: `processResult` 字段级 data race（race detector 发现）
+### CR-Fix 10: `processResult` 字段级 data race
 
 **问题**
 
@@ -347,7 +321,7 @@ r.stats.countLock.Unlock()
 
 **修复**
 
-1. `processResult()`: 将所有统计字段写入整体包裹在 `countLock.Lock()/Unlock()` 中（替代原来的 per-element 锁）
+1. `processResult()`: 将所有统计字段写入整体包裹在 `countLock.Lock()/Unlock()` 中
 2. `dynamicString()` / `finalString()`: 用 `countLock.RLock()` 保护 `Count` 读取
 
 **修改文件：** `core/report.go`
@@ -358,19 +332,21 @@ r.stats.countLock.Unlock()
 
 | # | 问题 | 严重程度 | 状态 |
 |---|------|---------|------|
-| 1 | `histogramJSON()` 未排序 `sizes` 导致分桶错误 | 🔴 高 | ✅ CR-Fix 1 |
-| 2 | JSON 模式空数据暴露哨兵值 | 🟡 中 | ✅ CR-Fix 2 |
-| 3 | `NewReport` variadic bool API 不清晰 | 🟡 中 | ✅ CR-Fix 3 |
-| 4 | `processResults` sleep 在 JSON 模式下无意义 | 🟡 中 | ✅ CR-Fix 4 |
-| 5 | text/json 分支大量重复代码 | 🟡 中 | ✅ CR-Fix 5 |
-| 6 | `go.sum` 残留旧版本哈希 | 🟢 低 | ✅ CR-Fix 6 |
-| 7 | `Percentiles` 值类型为 `int`，单位不明确 | 🟢 低 | ✅ CR-Fix 7 |
-| 8 | `countLock` 保护不一致 | 🟡 中 | ✅ CR-Fix 8 |
-| 9 | `String()` 中 `sort.Ints` data race | 🔴 高 | ✅ CR-Fix 9 |
-| 10 | `processResult` 字段级 data race | 🔴 高 | ✅ CR-Fix 10 |
-| 11 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
-| 12 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
-| 13 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
+| 1 | `WithPrefix` 反射误判 panic | 🔴 高 | ✅ Fix 1 |
+| 2 | `--key` flag 冲突致 TLS 失败 | 🔴 高 | ✅ Fix 2 |
+| 3 | clear/rename 高危命令 | 🔴 高 | ✅ Fix 3 |
+| 4 | `histogramJSON()` 未排序分桶错误 | 🔴 高 | ✅ CR-Fix 1 |
+| 5 | JSON 空数据暴露哨兵值 | 🟡 中 | ✅ CR-Fix 2 |
+| 6 | `NewReport` variadic bool API 不清晰 | 🟡 中 | ✅ CR-Fix 3 |
+| 7 | JSON 模式下无意义 sleep | 🟡 中 | ✅ CR-Fix 4 |
+| 8 | text/json 分支重复代码 | 🟡 中 | ✅ CR-Fix 5 |
+| 9 | `go.sum` 残留旧版本哈希 | 🟢 低 | ✅ CR-Fix 6 |
+| 10 | Percentiles 单位不明确 | 🟢 低 | ✅ CR-Fix 7 |
+| 11 | `countLock` 保护不一致 | 🟡 中 | ✅ CR-Fix 8 |
+| 12 | `String()` 中 `sort.Ints` data race | 🔴 高 | ✅ CR-Fix 9 |
+| 13 | `processResult` 字段级 data race | 🔴 高 | ✅ CR-Fix 10 |
+| 14 | `go 1.18 -> 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
+| 15 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（流程建议，非代码 bug） |
 
 ---
 
@@ -378,59 +354,14 @@ r.stats.countLock.Unlock()
 
 | 文件 | 修改内容 |
 |------|--------|
-| `cmd/root_cmd.go` | 禁用 clear 和 rename 命令 |
-| `cmd/find_cmd.go` | `--key` → `--match-key` |
-| `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
-| `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
+| `go.mod` | etcd client v3.5.0 -> v3.5.27，go 1.18 -> 1.24 |
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
-| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性；`String()` data race 修复；`processResult` 字段级 race 修复 |
-| `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |
+| `cmd/root_cmd.go` | 禁用 clear 和 rename 命令 |
+| `cmd/find_cmd.go` | `--key` -> `--match-key` |
+| `cmd/unmarsha_cmd.go` | `--key` -> `--target-key` |
+| `cmd/distribute_cmd.go` | 新增 JSON 输出；使用 `WithJSONMode()`；提取 text/json 公共逻辑 |
+| `core/report.go` | histogram 分桶排序；空数据保护；Functional Options；条件 sleep；单位显式化；countLock 一致性；data race 修复 |
 
 ---
 
-## 测试体系
-
-参考 etcd 的 `tests/` 独立模块结构，建立分层测试架构。
-
-### 目录结构
-
-```
-tests/                              # 独立 Go 模块，replace 指向主模块
-├── go.mod
-├── common/helpers.go               # 共享测试工具：mock KV 生成、FeedAndRun、JSON 解析
-├── unit/report_api_test.go         # 导出 API 单元测试
-├── integration/distribute_test.go  # 集成测试 + 契约测试
-├── benchmark/report_bench_test.go  # 基准测试
-├── race/race_test.go               # 竞态检测（go test -race）
-├── regression/bugfix_test.go       # 回归测试（覆盖 BUGFIX 10 项修复）
-└── stress/stress_test.go           # 压力测试
-core/
-└── report_test.go                  # 内部单元测试（可访问未导出类型）
-```
-
-### 测试覆盖汇总
-
-| 测试文件 | 测试数 | 类型 | 说明 |
-|---------|-------|------|------|
-| `core/report_test.go` | 10 | 单元 | 内部字段、sort、锁、空数据、JSON |
-| `tests/unit/` | 3 | 单元 | NewReport 导出 API |
-| `tests/integration/` | 5 | 集成+契约 | 完整管道、JSON schema |
-| `tests/benchmark/` | 4 | 基准 | 吞吐量、JSON 输出耗时 |
-| `tests/race/` | 3 | 竞态 | 多 goroutine + DynamicOutput |
-| `tests/regression/` | 7 | 回归 | CR-Fix 1~10 各项修复 |
-| `tests/stress/` | 3 | 压力 | 10K key、100 批并发、大值 |
-| **合计** | **35** | | |
-
-### 运行命令
-
-测试通过根目录 `Makefile` 统一入口，详见 [tests/README.md](tests/README.md)。
-
-```bash
-make test              # 全部测试（内部单元 + tests/ 模块）
-make test-unit         # 内部单元测试
-make test-external     # tests/ 模块全部测试
-make test-race         # 竞态检测（自动附加 -race）
-make test-bench        # 基准测试
-make test-stress       # 压力测试
-make vet               # go vet 静态检查
-```
+> 测试体系详见 [tests/README.md](tests/README.md)。

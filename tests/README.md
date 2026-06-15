@@ -115,12 +115,12 @@ GO_TEST_FLAGS="-v" make test-race
 ### 命名约定
 
 - 内部测试：`Test<FunctionName>_<Scenario>`
-- 回归测试：`TestCRFix<N>_<Description>`，与 `BUGFIX.md` 中的 CR-Fix 编号对应
+- 回归测试：`TestCRFix<N>_<Description>`，与 `CHANGELOG.md` 中的 CR-Fix 编号对应
 - 基准测试：`Benchmark<FunctionName>`
 
 ## Bugfix 回归保护
 
-`tests/regression/bugfix_test.go` 为 [BUGFIX.md](../BUGFIX.md) 中记录的每项修复提供回归测试：
+`tests/regression/bugfix_test.go` 为 [CHANGELOG.md](../CHANGELOG.md) 中记录的每项修复提供回归测试：
 
 | 测试名 | 对应修复 | 验证内容 |
 |--------|---------|---------|
