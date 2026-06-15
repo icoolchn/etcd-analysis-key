@@ -24,6 +24,9 @@ $ go build -o etcdctl+
 $ etcdctl+ --help
 ```
 
+> **Note:** If you encountered a panic like `` `WithPrefix` and `WithFromKey` cannot be set at the same time ``,
+> upgrading etcd client to v3.5.27 has fixed it. See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Function List
 
 1. **distribute** View data distribution according to data size
