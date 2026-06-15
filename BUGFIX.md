@@ -289,6 +289,44 @@ if isJSON {
 
 ---
 
+### CR-Fix 8: `countLock` 保护不一致
+
+**问题**
+
+`String()` 中调用 `PrintPercent()` 时使用 `countLock.RLock()/RUnlock()` 保护对 `sizes` 和 `sizeToCount` 的读取，但 `percentilesJSON()` 中调用 `percentiles()` 时未加锁。虽然 `JSON()` 在 `Run()` 完成后调用，实际安全，但与 `String()` 的加锁风格不一致，后续维护容易踩坑。
+
+**修复**
+
+在 `percentilesJSON()` 中加 `countLock.RLock()/RUnlock()`，与 `String()` 保持一致：
+
+```go
+r.stats.countLock.RLock()
+data := percentiles(r.stats.sizes, r.stats.sizeToCount)
+r.stats.countLock.RUnlock()
+```
+
+**修改文件：** `core/report.go`
+
+---
+
+## 修复状态汇总
+
+| # | 问题 | 严重程度 | 状态 |
+|---|------|---------|------|
+| 1 | `histogramJSON()` 未排序 `sizes` 导致分桶错误 | 🔴 高 | ✅ CR-Fix 1 |
+| 2 | JSON 模式空数据暴露哨兵值 | 🟡 中 | ✅ CR-Fix 2 |
+| 3 | `NewReport` variadic bool API 不清晰 | 🟡 中 | ✅ CR-Fix 3 |
+| 4 | `processResults` sleep 在 JSON 模式下无意义 | 🟡 中 | ✅ CR-Fix 4 |
+| 5 | text/json 分支大量重复代码 | 🟡 中 | ✅ CR-Fix 5 |
+| 6 | `go.sum` 残留旧版本哈希 | 🟢 低 | ✅ CR-Fix 6 |
+| 7 | `Percentiles` 值类型为 `int`，单位不明确 | 🟢 低 | ✅ CR-Fix 7 |
+| 8 | `countLock` 保护不一致 | 🟡 中 | ✅ CR-Fix 8 |
+| 9 | `go 1.18 → 1.24` 跨度较大 | 🟡 中 | ⏭️ 跳过（需确认 CI 环境） |
+| 10 | 注释禁用命令是硬编码 | 🟡 中 | ⏭️ 跳过（小工具可接受） |
+| 11 | `BUGFIX.md` 适合放 commit body | 🟢 低 | ⏭️ 跳过（流程建议） |
+
+---
+
 ## 修改文件汇总
 
 | 文件 | 修改内容 |
@@ -298,5 +336,5 @@ if isJSON {
 | `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 | `go.mod` | etcd client v3.5.0 → v3.5.27，go 1.18 → 1.24 |
 | `go.sum` | 依赖校验和更新；`go mod tidy` 清理 219 行旧哈希 |
-| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化 |
+| `core/report.go` | 修复 `histogramJSON()` 分桶排序；JSON 空数据保护；`NewReport` 改为 functional options；JSON 模式跳过无用 sleep；`Percentiles` 字段单位显式化；`countLock` 保护一致性 |
 | `cmd/distribute_cmd.go` | 使用 `core.WithJSONMode()` 替代 `true`；提取 text/json 公共逻辑 |

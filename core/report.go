@@ -325,7 +325,9 @@ func (r *report) histogramJSON() []BucketJSON {
 
 func (r *report) percentilesJSON() map[string]int {
 	result := make(map[string]int)
+	r.stats.countLock.RLock()
 	data := percentiles(r.stats.sizes, r.stats.sizeToCount)
+	r.stats.countLock.RUnlock()
 	for i, p := range pctls {
 		if i < len(data) {
 			key := fmt.Sprintf("p%d_bytes", int(p))
