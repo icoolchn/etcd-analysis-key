@@ -120,11 +120,11 @@ func (r *report) String() string {
 	buffer.WriteString(fmt.Sprintf("  Largest:\t%s.\n", ReadableSize(r.stats.Largest)))
 	buffer.WriteString(fmt.Sprintf("  Average:\t%s.\n", ReadableSize(r.stats.Average)))
 
+	r.stats.countLock.Lock()
 	sort.Ints(r.stats.sizes)
 	buffer.WriteString(r.histogram())
-	r.stats.countLock.RLock()
 	buffer.WriteString(PrintPercent(r.stats.sizes, r.stats.sizeToCount))
-	r.stats.countLock.RUnlock()
+	r.stats.countLock.Unlock()
 
 	return buffer.String()
 }
@@ -175,9 +175,7 @@ func (r *report) histogram() string {
 		s := r.stats.sizes[i]
 		if s <= buckets[bi] {
 			i++
-			r.stats.countLock.RLock()
 			counts[bi] += r.stats.sizeToCount[s]
-			r.stats.countLock.RUnlock()
 			if max < counts[bi] {
 				max = counts[bi]
 			}
