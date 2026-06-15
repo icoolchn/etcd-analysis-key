@@ -423,19 +423,14 @@ core/
 
 ### 运行命令
 
+测试通过根目录 `Makefile` 统一入口，详见 [tests/README.md](tests/README.md)。
+
 ```bash
-# 内部单元测试
-go test -v ./core/
-
-# tests/ 模块全部测试
-cd tests && go test -v ./...
-
-# 竞态检测
-cd tests && go test -race -v ./race/ ./regression/
-
-# 基准测试
-cd tests && go test -bench=. -benchmem ./benchmark/
-
-# 压力测试
-cd tests && go test -v -timeout 60s ./stress/
+make test              # 全部测试（内部单元 + tests/ 模块）
+make test-unit         # 内部单元测试
+make test-external     # tests/ 模块全部测试
+make test-race         # 竞态检测（自动附加 -race）
+make test-bench        # 基准测试
+make test-stress       # 压力测试
+make vet               # go vet 静态检查
 ```
