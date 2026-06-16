@@ -1,133 +1,133 @@
-# etcd-analysis-key 测试体系
+# etcd-analysis Test Suite
 
-本目录为独立 Go 模块，通过 `replace` 指令引用主模块，采用与 etcd `tests/` 对齐的分层测试架构。
+This directory is an independent Go module that references the main module via a `replace` directive. It follows a layered test architecture aligned with etcd's `tests/` structure.
 
-## 目录结构
+## Directory Layout
 
 ```
 tests/
-├── go.mod                          # 独立模块，replace => ../
+├── go.mod                          # Independent module, replace => ../
 ├── go.sum
 ├── common/
-│   └── helpers.go                  # 共享工具：MakeKVs, FeedAndRun, ParseReportJSON
+│   └── helpers.go                  # Shared utilities: MakeKVs, FeedAndRun, ParseReportJSON
 ├── unit/
-│   └── report_api_test.go          # 导出 API 单元测试
+│   └── report_api_test.go          # Exported API unit tests
 ├── integration/
-│   └── distribute_test.go          # 集成测试 + JSON 契约测试
+│   └── distribute_test.go          # Integration + JSON contract tests
 ├── benchmark/
-│   └── report_bench_test.go        # 基准性能测试
+│   └── report_bench_test.go        # Performance benchmarks
 ├── race/
-│   └── race_test.go                # 并发竞态测试
+│   └── race_test.go                # Concurrency race tests
 ├── regression/
-│   └── bugfix_test.go              # BUGFIX 回归测试（CR-Fix 1~10）
+│   └── bugfix_test.go              # Bugfix regression tests (CR-Fix 1~10)
 └── stress/
-    └── stress_test.go              # 压力测试（大数据量、高并发）
+    └── stress_test.go              # Stress tests (large data, high concurrency)
 
 core/
-└── report_test.go                  # 内部单元测试（可访问未导出类型）
+└── report_test.go                  # Internal unit tests (access to unexported types)
 ```
 
-## 测试覆盖汇总
+## Test Coverage Summary
 
-| 测试文件 | 测试数 | 类型 | 说明 |
-|---------|-------|------|------|
-| `core/report_test.go` | 10 | 内部单元 | 字段赋值、sort 排序、锁行为、空数据、JSON 输出 |
-| `tests/unit/` | 3 | 导出 API | NewReport 构造、WithJSONMode 选项 |
-| `tests/integration/` | 5 | 集成+契约 | 完整数据管道、JSON schema 结构验证 |
-| `tests/benchmark/` | 4 | 基准 | 吞吐量、JSON 输出耗时、大 key 集 |
-| `tests/race/` | 3 | 竞态 | 多 goroutine 并发写、DynamicOutput |
-| `tests/regression/` | 7 | 回归 | CR-Fix 1~10 各项修复的回归保护 |
-| `tests/stress/` | 3 | 压力 | 10K key、100 批并发写入、超大 value |
-| **合计** | **35** | | |
+| Test File | Count | Type | Description |
+|-----------|-------|------|-------------|
+| `core/report_test.go` | 10 | Internal unit | Field assignment, sort ordering, lock behavior, empty data, JSON output |
+| `tests/unit/` | 3 | Exported API | NewReport construction, WithJSONMode option |
+| `tests/integration/` | 5 | Integration + Contract | Full data pipeline, JSON schema validation |
+| `tests/benchmark/` | 4 | Benchmark | Throughput, JSON output latency, large key sets |
+| `tests/race/` | 3 | Race | Multi-goroutine concurrent writes, DynamicOutput |
+| `tests/regression/` | 7 | Regression | CR-Fix 1~10 regression protection |
+| `tests/stress/` | 3 | Stress | 10K keys, 100-batch concurrent writes, large values |
+| **Total** | **35** | | |
 
-## 运行方式
+## Running Tests
 
-所有测试命令均通过根目录 `Makefile` 统一入口：
+All test commands are unified under the root `Makefile`:
 
 ```bash
-# 运行全部测试（内部单元 + tests/ 模块）
+# Run all tests (internal unit + tests/ module)
 make test
 
-# 各分层单独运行
-make test-unit              # 内部单元测试（core/report_test.go）
-make test-external          # tests/ 模块全部测试
-make test-integration       # 仅集成测试
-make test-race              # 竞态检测（自动附加 -race 标志）
-make test-regression        # 回归测试（自动附加 -race 标志）
-make test-stress            # 压力测试（timeout 60s）
-make test-bench             # 基准测试（输出 benchmem）
+# Run individual layers
+make test-unit              # Internal unit tests (core/report_test.go)
+make test-external          # All tests in tests/ module
+make test-integration       # Integration tests only
+make test-race              # Race detection (auto-append -race flag)
+make test-regression        # Regression tests (auto-append -race flag)
+make test-stress            # Stress tests (timeout 60s)
+make test-bench             # Benchmarks (output benchmem)
 
-# 工具类
-make build                  # 构建二进制
-make vet                    # go vet 静态检查
-make tidy                   # go mod tidy（主模块 + tests/ 模块）
+# Utilities
+make build                  # Build binary
+make vet                    # go vet static analysis
+make tidy                   # go mod tidy (main module + tests/ module)
 
-# 便捷：运行指定测试
-make test-run RUN="TestNewReport"               # 运行匹配的测试
-make test-run RUN="TestNewReport" DIR="./core"  # 在指定目录运行
+# Convenience: run specific tests
+make test-run RUN="TestNewReport"               # Run matching tests
+make test-run RUN="TestNewReport" DIR="./core"  # Run in specific directory
 ```
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `GO_TEST_FLAGS` | （空） | 传递额外参数给 `go test` |
-| `RUN` | （空） | `-run` 正则过滤，配合 `test-run` 使用 |
-| `DIR` | `./...` | 指定测试目录，配合 `test-run` 使用 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GO_TEST_FLAGS` | (empty) | Extra arguments passed to `go test` |
+| `RUN` | (empty) | `-run` regex filter, used with `test-run` |
+| `DIR` | `./...` | Test directory, used with `test-run` |
 
-### 示例
+### Examples
 
 ```bash
-# 带 verbose 和 count 运行回归测试
+# Run regression tests with verbose output and count
 GO_TEST_FLAGS="-v -count=5" make test-regression
 
-# 只运行某个测试函数
+# Run a specific test function
 make test-run RUN="TestCRFix3_FunctionalOptions" DIR="./tests/regression"
 
-# 竞态检测 + 详细输出
+# Race detection with verbose output
 GO_TEST_FLAGS="-v" make test-race
 ```
 
-## 编写测试指南
+## Writing Tests Guide
 
-### 选择测试层级
+### Choosing a Test Layer
 
-| 场景 | 推荐层级 |
-|------|---------|
-| 验证未导出字段或内部行为 | `core/report_test.go`（内部单元） |
-| 验证导出的公共 API | `tests/unit/` |
-| 多模块协作的完整流程 | `tests/integration/` |
-| 并发安全性 | `tests/race/` |
-| 修复某个 bug 后的回归保护 | `tests/regression/` |
-| 性能基准 | `tests/benchmark/` |
-| 极端条件下的稳定性 | `tests/stress/` |
+| Scenario | Recommended Layer |
+|----------|-----------------|
+| Verify unexported fields or internal behavior | `core/report_test.go` (internal unit) |
+| Verify exported public API | `tests/unit/` |
+| Full multi-module end-to-end flow | `tests/integration/` |
+| Concurrency safety | `tests/race/` |
+| Regression protection after bugfix | `tests/regression/` |
+| Performance benchmarks | `tests/benchmark/` |
+| Stability under extreme conditions | `tests/stress/` |
 
-### 使用共享工具
+### Using Shared Utilities
 
-`tests/common/helpers.go` 提供以下工具函数：
+`tests/common/helpers.go` provides:
 
-- `MakeKVs(sizes []int) []*mvccpb.KeyValue` — 按指定大小生成 mock KV 数据
-- `SizeOfKey(kv *mvccpb.KeyValue) int` — 计算 key+value 总字节数
-- `FeedAndRun(t, r, sizes)` — 填充数据并触发报告生成
-- `ParseReportJSON(t, output)` — 解析 JSON 输出为 `ReportJSON` 结构体
-- `FeedAndRunB(b, r, sizes)` — benchmark 版本的 FeedAndRun
+- `MakeKVs(sizes []int) []*mvccpb.KeyValue` — Generate mock KV data with specified sizes
+- `SizeOfKey(kv *mvccpb.KeyValue) int` — Calculate total bytes of key + value
+- `FeedAndRun(t, r, sizes)` — Feed data and trigger report generation
+- `ParseReportJSON(t, output)` — Parse JSON output into `ReportJSON` struct
+- `FeedAndRunB(b, r, sizes)` — Benchmark version of FeedAndRun
 
-### 命名约定
+### Naming Conventions
 
-- 内部测试：`Test<FunctionName>_<Scenario>`
-- 回归测试：`TestCRFix<N>_<Description>`，与 `CHANGELOG.md` 中的 CR-Fix 编号对应
-- 基准测试：`Benchmark<FunctionName>`
+- Internal tests: `Test<FunctionName>_<Scenario>`
+- Regression tests: `TestCRFix<N>_<Description>`, corresponding to CR-Fix numbers in [CHANGELOG.md](../CHANGELOG.md)
+- Benchmarks: `Benchmark<FunctionName>`
 
-## Bugfix 回归保护
+## Bugfix Regression Protection
 
-`tests/regression/bugfix_test.go` 为 [CHANGELOG.md](../CHANGELOG.md) 中记录的每项修复提供回归测试：
+`tests/regression/bugfix_test.go` provides regression tests for each fix documented in [CHANGELOG.md](../CHANGELOG.md):
 
-| 测试名 | 对应修复 | 验证内容 |
-|--------|---------|---------|
-| `TestCRFix1_HistogramSort` | CR-Fix 1 | histogram 分桶按 count 降序排列 |
-| `TestCRFix2_EmptyDataGuard` | CR-Fix 2 | 空数据 JSON 输出不 panic |
-| `TestCRFix3_FunctionalOptions` | CR-Fix 3 | WithJSONMode 正确设置 jsonMode |
-| `TestCRFix4_NoSleepInJSON` | CR-Fix 4 | JSON 模式下不执行 time.Sleep |
-| `TestCRFix7_BytesSuffix` | CR-Fix 7 | 百分位 key 含 `_bytes` 后缀 |
-| `TestCRFix8_CountLockConsistency` | CR-Fix 8 | percentilesJSON 读锁一致性 |
-| `TestCRFix10_ProcessResultRace` | CR-Fix 10 | processResult 字段级竞态保护 |
+| Test Name | Corresponding Fix | Verification |
+|-----------|------------------|--------------|
+| `TestCRFix1_HistogramSort` | CR-Fix 1 | Histogram buckets sorted by count descending |
+| `TestCRFix2_EmptyDataGuard` | CR-Fix 2 | Empty data JSON output does not panic |
+| `TestCRFix3_FunctionalOptions` | CR-Fix 3 | WithJSONMode correctly sets jsonMode |
+| `TestCRFix4_NoSleepInJSON` | CR-Fix 4 | time.Sleep not executed in JSON mode |
+| `TestCRFix7_BytesSuffix` | CR-Fix 7 | Percentile keys contain `_bytes` suffix |
+| `TestCRFix8_CountLockConsistency` | CR-Fix 8 | percentilesJSON read lock consistency |
+| `TestCRFix10_ProcessResultRace` | CR-Fix 10 | processResult field-level race protection |
