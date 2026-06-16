@@ -31,36 +31,36 @@ Each size interval is '(maxSize - minSize) / bucket'.
 According to the output below, it means:
 when the data size is '0.0 B', the count of this kind of data is 12.
 when the data size is greater than '0.0B' and less than or equal to '573.0 B', the count is 275.
-'573.0 B' < size <= '1.1 KB', count 80.
+'573.0 B' < size <= '1.1 KiB', count 80.
 
 Example:
 $ distribute --type=value --bucket=8
 Summary:
   Count:        399.
-  Total:        267.9 KB.
+  Total:        267.9 KiB.
   Smallest:     0.0 Byte.
-  Largest:      4.5 KB.
+  Largest:      4.5 KiB.
   Average:      687.0 Byte.
 
 Size histogram:
   0.0 B [12]    |∎
   573.0 B [275] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  1.1 KB [80]   |∎∎∎∎∎∎∎∎∎∎
-  1.7 KB [0]    |
-  2.2 KB [0]    |
-  2.8 KB [0]    |
-  3.4 KB [0]    |
-  3.9 KB [0]    |
-  4.5 KB [32]   |∎∎∎∎
+  1.1 KiB [80]   |∎∎∎∎∎∎∎∎∎∎
+  1.7 KiB [0]    |
+  2.2 KiB [0]    |
+  2.8 KiB [0]    |
+  3.4 KiB [0]    |
+  3.9 KiB [0]    |
+  4.5 KiB [32]   |∎∎∎∎
 
 Size distribution:
   10% in 3.0 Byte.
   25% in 4.0 Byte.
   50% in 424.0 Byte.
   75% in 854.0 Byte.
-  90% in 1.0 KB.
-  95% in 4.5 KB.
-  99% in 4.5 KB.
+  90% in 1.0 KiB.
+  95% in 4.5 KiB.
+  99% in 4.5 KiB.
 `,
 		Run: distributeFunc,
 	}

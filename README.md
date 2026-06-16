@@ -51,7 +51,7 @@ $ etcdctl+ distribute
 
 Summary:
   Count:        116.
-  Total:        7.3 KB.
+  Total:        7.3 KiB.
   Smallest:     22.0 B.
   Largest:      85.0 B.
   Average:      64.0 B.
