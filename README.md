@@ -9,7 +9,7 @@ When testing the stability of the system, it may be necessary to pay attention t
 ### Getting the source code
 
 ```shell
-$ git clone https://github.com/SimFG/etcd-analysis.git
+$ git clone https://github.com/icoolchn/etcd-analysis-key.git
 ```
 
 ### Build
@@ -235,12 +235,4 @@ progress: 0
 
 ---
 
-## All contributors
 
-<a href="https://github.com/SimFG/etcd-analysis/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=SimFG/etcd-analysis" />
-</a>
-
-## Stargazers over time
-
-[![Stargazers over time](https://starchart.cc/SimFG/etcd-analysis.svg)](https://starchart.cc/SimFG/etcd-analysis)
