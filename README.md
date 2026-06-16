@@ -4,12 +4,14 @@ etcd is generally used to store system metadata or service discovery, and is sui
 
 When testing the stability of the system, it may be necessary to pay attention to the size distribution of the data currently stored in etcd by the system. That's why this project came about.
 
+> 内部文档见 [docs/](docs/) 目录。
+
 ## Getting started
 
 ### Getting the source code
 
 ```shell
-$ git clone https://github.com/icoolchn/etcd-analysis-key.git
+$ git clone http://git.17usoft.com/middleware_sre/etcd-analysis-key.git
 ```
 
 ### Build
