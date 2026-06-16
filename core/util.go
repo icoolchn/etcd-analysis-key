@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	byteUnits = []string{"b", "kb", "mb", "gb", "tb", "pb", "eb"}
+	byteUnits = []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
 )
 
 func Exit(err error) {
