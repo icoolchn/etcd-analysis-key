@@ -6,9 +6,8 @@ etcd-analysis 是一个 **etcd 数据分析 CLI 工具**（二进制名 `etcdctl
 
 > etcd 通常用于存储系统元数据或服务发现，适合存储小型键值对。同时 etcd 对键值对的大小很敏感，存储大键值对时，如果数量过多，会带来很多不良影响，例如 watch 功能的稳定性降低，以及占用大量内存。
 
-项目来源：[https://github.com/SimFG/etcd-analysis](https://github.com/SimFG/etcd-analysis)（上游，已归档）
-Fix 版：   [https://github.com/icoolchn/etcd-analysis-key](https://github.com/icoolchn/etcd-analysis-key)（GitHub 公开）
-内部版：   http://git.17usoft.com/middleware_sre/etcd-analysis-key.git（Company GitLab）
+项目来源：https://github.com/SimFG/etcd-analysis（上游，已归档）
+内部 Fix 版：http://git.17usoft.com/middleware_sre/etcd-analysis-key.git（Company GitLab）
 
 ---
 
