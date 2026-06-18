@@ -4,4 +4,4 @@
 analysis.txt
 PLAN.MD
 etcdctl+
-bin/etcdctl+
+bin/
