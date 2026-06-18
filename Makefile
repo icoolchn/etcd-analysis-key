@@ -52,6 +52,21 @@ tidy:
 
 # Build
 
+BINARY ?= etcdctl+
+LDFLAGS := -s -w
+
 .PHONY: build
 build:
 	go build -o bin/etcdctl+ main.go
+
+.PHONY: build-all
+build-all: build-mac build-linux ## 编译 mac + linux 多平台二进制
+
+.PHONY: build-mac
+build-mac: ## 编译 macOS (arm64 + amd64)
+	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-darwin-arm64 main.go
+	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-darwin-amd64 main.go
+
+.PHONY: build-linux
+build-linux: ## 编译 Linux amd64
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-amd64 main.go
