@@ -113,14 +113,19 @@ func (r *report) processResult(res []*mvccpb.KeyValue) {
 func (r *report) String() string {
 	var buffer bytes.Buffer
 
+	// processResult writes Count/Total/Smallest/Largest/Average/sizes under
+	// countLock. DynamicOutput reads String() concurrently from another
+	// goroutine, so the whole format — including the scalar stats above — must
+	// hold the lock, not just the sizes/sizeToCount section. histogram() and
+	// PrintPercent rely on the caller holding the lock; keeping them inside is
+	// unchanged semantics.
+	r.stats.countLock.Lock()
 	buffer.WriteString("Summary:\n")
 	buffer.WriteString(fmt.Sprintf("  Count:\t%d.\n", r.stats.Count))
 	buffer.WriteString(fmt.Sprintf("  Total:\t%s.\n", ReadableSize(r.stats.Total)))
 	buffer.WriteString(fmt.Sprintf("  Smallest:\t%s.\n", ReadableSize(r.stats.Smallest)))
 	buffer.WriteString(fmt.Sprintf("  Largest:\t%s.\n", ReadableSize(r.stats.Largest)))
 	buffer.WriteString(fmt.Sprintf("  Average:\t%s.\n", ReadableSize(r.stats.Average)))
-
-	r.stats.countLock.Lock()
 	sort.Ints(r.stats.sizes)
 	buffer.WriteString(r.histogram())
 	buffer.WriteString(PrintPercent(r.stats.sizes, r.stats.sizeToCount))

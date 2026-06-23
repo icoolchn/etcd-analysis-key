@@ -41,5 +41,6 @@ func init() {
 	rootCmd.AddCommand(NewDecodeCmd())
 	// rootCmd.AddCommand(NewRenameCmd())  // 🟠 non-atomic Get→Put→Delete, may cause inconsistency
 	rootCmd.AddCommand(NewUnmarshalCmd())
+	rootCmd.AddCommand(NewSummaryCmd())
 	rootCmd.AddCommand(cobracompletefig.CreateCompletionSpecCommand())
 }

@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/SimFG/etcd-analysis/core"
 	"github.com/spf13/cobra"
@@ -13,6 +13,9 @@ var (
 	distributeType     string
 	bucketCount        int
 	distributeWriteOut string
+	distributePrefix   string
+	distributePageSize int
+	distributePageSleep time.Duration
 )
 
 func NewDistributeCmd() *cobra.Command {
@@ -38,9 +41,9 @@ $ distribute --type=value --bucket=8
 Summary:
   Count:        399.
   Total:        267.9 KiB.
-  Smallest:     0.0 Byte.
+  Smallest:     0.0 B.
   Largest:      4.5 KiB.
-  Average:      687.0 Byte.
+  Average:      687.0 B.
 
 Size histogram:
   0.0 B [12]    |∎
@@ -54,10 +57,10 @@ Size histogram:
   4.5 KiB [32]   |∎∎∎∎
 
 Size distribution:
-  10% in 3.0 Byte.
-  25% in 4.0 Byte.
-  50% in 424.0 Byte.
-  75% in 854.0 Byte.
+  10% in 3.0 B.
+  25% in 4.0 B.
+  50% in 424.0 B.
+  75% in 854.0 B.
   90% in 1.0 KiB.
   95% in 4.5 KiB.
   99% in 4.5 KiB.
@@ -68,6 +71,9 @@ Size distribution:
 	cmd.Flags().StringVar(&distributeType, "type", "key", "Distribution basis; key, value or kv")
 	cmd.Flags().IntVar(&bucketCount, "bucket", 5, "Bucket Count")
 	cmd.Flags().StringVar(&distributeWriteOut, "write-out", "text", "Output format: text or json")
+	cmd.Flags().StringVar(&distributePrefix, "prefix", "", "Only scan keys with the given prefix (server-side)")
+	cmd.Flags().IntVar(&distributePageSize, "page-size", core.DefaultPageSize(), "Per-request page size")
+	cmd.Flags().DurationVar(&distributePageSleep, "page-sleep", 0, "Sleep between pages, e.g. 50ms")
 
 	cmd.RegisterFlagCompletionFunc("write-out", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		return []string{"text", "json"}, cobra.ShellCompDirectiveDefault
@@ -81,18 +87,25 @@ Size distribution:
 
 func distributeFunc(cmd *cobra.Command, args []string) {
 	core.InitClient()
-	_, datac := core.GetAllData()
+	scanOpts := []core.ScanOption{core.WithPageSize(distributePageSize)}
+	if distributePrefix != "" {
+		scanOpts = append(scanOpts, core.WithPrefix(distributePrefix))
+	}
+	if distributePageSleep > 0 {
+		scanOpts = append(scanOpts, core.WithPageSleep(distributePageSleep))
+	}
+	_, datac := core.ScanData(scanOpts...)
 
 	sizeOf := func(kv *mvccpb.KeyValue) int {
 		switch distributeType {
 		case "value":
-			return binary.Size(kv.Value)
+			return len(kv.Value)
 		case "kv":
-			return binary.Size(kv.Key) + binary.Size(kv.Value)
+			return len(kv.Key) + len(kv.Value)
 		case "key":
 			fallthrough
 		default:
-			return binary.Size(kv.Key)
+			return len(kv.Key)
 		}
 	}
 

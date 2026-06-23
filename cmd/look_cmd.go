@@ -2,23 +2,29 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"time"
+
 	"github.com/SimFG/etcd-analysis/core"
 	"github.com/spf13/cobra"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"io"
-	"os"
-	"time"
 )
 
 var (
 	showValue    bool
 	writeOut     string
+	outputFile   string
 	hang         bool
 	hangInterval int64
+
+	keysOnly bool
+	lookPrefix string
+	pageSize  int
+	pageSleep time.Duration
 
 	filterAttribute string
 	filterMax       int
@@ -40,26 +46,40 @@ $ look | more
 $ look | vim
 Of course, you can also save the output as a file by setting <write-out> to 'file', and the generated file is named 'analysis.txt'.
 
-If you want to continuously observe all keys, you can set <hang> to true, and you can use <hang-interval> to set the update interval. 
+If you want to continuously observe all keys, you can set <hang> to true, and you can use <hang-interval> to set the update interval.
 This function only works when <write-out> is set to 'file'.
 
 Sometimes, you may only want to observe data of a certain range size, you can set <filter> related parameters.
 <filter> can set how to calculate the data size, including 'none', 'key', 'value' and 'kv';
 <filter-max> and <filter-min> are used to specify the maximum and minimum values of the data, respectively.
+
+Production tip: prefer '--keys-only' plus '--write-out=jsonl --output=<file>' for a low-risk snapshot,
+then analyze the JSONL offline with 'summary --input=<file>'.
+
+Combination rules:
+  --keys-only --filter=none|key : allowed
+  --keys-only --filter=value|kv : NOT allowed (no value to size)
+  --keys-only --show-value      : NOT allowed (semantic conflict)
 `,
 		Run: lookFunc,
 	}
 
-	cmd.Flags().BoolVar(&showValue, "show-value", false, "Show the value or not")
-	cmd.Flags().StringVar(&writeOut, "write-out", "stdout", "The looking type")
+	cmd.Flags().BoolVar(&showValue, "show-value", false, "Show the value or not (base64)")
+	cmd.Flags().StringVar(&writeOut, "write-out", "stdout", "Output type: stdout, file, log, jsonl")
+	cmd.Flags().StringVar(&outputFile, "output", "", "Output file path for file/log/jsonl (default analysis.txt or analysis.jsonl)")
 	cmd.Flags().BoolVar(&hang, "hang", false, "Get updates periodically, only '--write-out=file' takes effect")
 	cmd.Flags().Int64Var(&hangInterval, "hang-interval", 2, "Update interval, and the unit is 's'")
 	cmd.Flags().StringVar(&filterAttribute, "filter", "none", "The filter attribute")
 	cmd.Flags().IntVar(&filterMax, "filter-max", -1, "The filter max value")
 	cmd.Flags().IntVar(&filterMin, "filter-min", -1, "The filter min value")
 
+	cmd.Flags().BoolVar(&keysOnly, "keys-only", false, "Only fetch key metadata (no value); uses etcd WithKeysOnly()")
+	cmd.Flags().StringVar(&lookPrefix, "prefix", "", "Only scan keys with the given prefix (server-side)")
+	cmd.Flags().IntVar(&pageSize, "page-size", core.DefaultPageSize(), "Per-request page size")
+	cmd.Flags().DurationVar(&pageSleep, "page-sleep", 0, "Sleep between pages, e.g. 50ms")
+
 	cmd.RegisterFlagCompletionFunc("write-out", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-		return []string{"stdout", "file", "log"}, cobra.ShellCompDirectiveDefault
+		return []string{"stdout", "file", "log", "jsonl"}, cobra.ShellCompDirectiveDefault
 	})
 	cmd.RegisterFlagCompletionFunc("filter", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		return []string{"none", "key", "value", "kv"}, cobra.ShellCompDirectiveDefault
@@ -67,18 +87,49 @@ Sometimes, you may only want to observe data of a certain range size, you can se
 	return cmd
 }
 
-func isLog() bool {
-	return writeOut == "log"
+func isLog() bool  { return writeOut == "log" }
+func isJSONL() bool { return writeOut == "jsonl" }
+
+// validateLookFlags enforces the combination rules from the improvement plan.
+func validateLookFlags() {
+	if err := core.CheckFilterCombination(keysOnly, filterAttribute); err != nil {
+		core.Exit(err)
+	}
+	if keysOnly && showValue {
+		core.Exit(fmt.Errorf("--keys-only cannot be combined with --show-value: semantic conflict"))
+	}
+}
+
+// lookFilter returns the shared FilterConfig built from look's flags.
+func lookFilter() core.FilterConfig {
+	return core.FilterConfig{Attribute: filterAttribute, Min: filterMin, Max: filterMax}
 }
 
 func lookFunc(cmd *cobra.Command, args []string) {
+	validateLookFlags()
 	core.InitClient()
-	resp, datac := core.GetAllData()
+
+	scanOpts := []core.ScanOption{core.WithPageSize(pageSize)}
+	if lookPrefix != "" {
+		scanOpts = append(scanOpts, core.WithPrefix(lookPrefix))
+	}
+	if keysOnly {
+		scanOpts = append(scanOpts, core.WithKeysOnly())
+	}
+	if pageSleep > 0 {
+		scanOpts = append(scanOpts, core.WithPageSleep(pageSleep))
+	}
+
+	resp, datac := core.ScanData(scanOpts...)
 
 	var writer io.Writer
 	switch writeOut {
 	case "file", "log":
-		f := GetFileWriter()
+		f := GetFileWriter(outputFile, "analysis.txt")
+		defer f.Close()
+		writer = f
+	case "jsonl":
+		f := GetFileWriter(outputFile, "analysis.jsonl")
 		defer f.Close()
 		writer = f
 	case "stdout":
@@ -86,6 +137,7 @@ func lookFunc(cmd *cobra.Command, args []string) {
 	default:
 		writer = os.Stdout
 	}
+
 	appendBuffer(resp, datac, writer)
 	if hang && writeOut == "file" {
 		ct := time.Tick(time.Second * time.Duration(hangInterval))
@@ -93,7 +145,7 @@ func lookFunc(cmd *cobra.Command, args []string) {
 		for {
 			select {
 			case <-ct:
-				resp, datac = core.GetAllData()
+				resp, datac = core.ScanData(scanOpts...)
 				appendBuffer(resp, datac, writer)
 				fmt.Println(i, "flush...")
 				i++
@@ -108,64 +160,87 @@ func appendBuffer(resp *clientv3.GetResponse, datac <-chan []*mvccpb.KeyValue, w
 		f.Seek(0, 0)
 	}
 	var buffer bytes.Buffer
+	if isJSONL() {
+		drainJSONL(datac, writer)
+		return
+	}
 	if !isLog() {
 		buffer.WriteString("Current Stage\n")
 		buffer.WriteString(fmt.Sprintf("  %s", resp.Header.String()))
 		buffer.WriteString("\nKv List\n")
-		buffer.WriteString("| Key | Value | Size | CreateRevision | ModRevision | Version | Lease |\n")
+		buffer.WriteString("| Key | Value | KeySize | ValueSize | KvSize | CreateRevision | ModRevision | Version | Lease |\n")
 	}
 
 	for data := range datac {
 		for _, kv := range data {
-			size, ok := filter(kv)
-			if ok {
+			if filterReject(kv) {
 				continue
 			}
-			v := "-"
-			if showValue {
-				v = base64.StdEncoding.EncodeToString(kv.Value)
-			}
-			format := "| %s | %s | %s | %d | %d | %d | %d |\n"
+			m := core.KVToMeta(kv, keysOnly, showValue)
 			if isLog() {
-				format = "key=%s value=%s size=%s create_revision=%d mod_revision=%d version=%d lease=%d\n"
+				buffer.WriteString(core.FormatLogLine(m))
+				buffer.WriteByte('\n')
+				continue
 			}
-			buffer.WriteString(fmt.Sprintf(format,
-				string(kv.Key), v,
-				core.ReadableSize(size),
-				kv.CreateRevision, kv.ModRevision, kv.Version,
-				kv.Lease))
+			buffer.WriteString(formatTableRow(m))
 		}
 	}
 
 	buffer.WriteTo(writer)
 }
 
-func filter(kv *mvccpb.KeyValue) (int, bool) {
-	size := -1
-	switch filterAttribute {
-	case "key":
-		size = binary.Size(kv.Key)
-	case "value":
-		size = binary.Size(kv.Value)
-	case "kv":
-		size = binary.Size(kv.Key) + binary.Size(kv.Value)
-	default:
-		size = -1
+// drainJSONL streams KVs to the writer as one JSON object per line without
+// buffering the whole keyspace in memory.
+func drainJSONL(datac <-chan []*mvccpb.KeyValue, writer io.Writer) {
+	for data := range datac {
+		for _, kv := range data {
+			if filterReject(kv) {
+				continue
+			}
+			m := core.KVToMeta(kv, keysOnly, showValue)
+			fmt.Fprintln(writer, jsonlLine(m))
+		}
 	}
-
-	if size < 0 || (filterMin < 0 && filterMax < 0) {
-		return binary.Size(kv.Key) + binary.Size(kv.Value), false
-	}
-
-	if (size >= filterMin && filterMax < 0) || (filterMin < 0 && size <= filterMax) ||
-		(size >= filterMin && size <= filterMax) {
-		return size, false
-	}
-	return size, true
 }
 
-func GetFileWriter() *os.File {
-	f, err := os.OpenFile("analysis.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+// jsonlLine marshals a KeyMeta to a compact JSON line.
+func jsonlLine(m core.KeyMeta) string {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Sprintf(`{"key":%q,"error":%q}`, m.Key, err.Error())
+	}
+	return string(b)
+}
+
+func formatTableRow(m core.KeyMeta) string {
+	v := "-"
+	if m.Value != nil {
+		v = *m.Value
+	}
+	if m.HasValue() {
+		return fmt.Sprintf("| %s | %s | %d | %d | %d | %d | %d | %d | %d |\n",
+			m.Key, v, m.KeySizeBytes, *m.ValueSizeBytes, *m.KvSizeBytes,
+			m.CreateRevision, m.ModRevision, m.Version, m.Lease)
+	}
+	return fmt.Sprintf("| %s | %s | %d | - | - | %d | %d | %d | %d |\n",
+		m.Key, v, m.KeySizeBytes,
+		m.CreateRevision, m.ModRevision, m.Version, m.Lease)
+}
+
+// filterReject reports whether kv should be dropped by the --filter rules.
+// In keys-only mode only 'key' filtering is meaningful; value/kv are rejected
+// upstream by validateLookFlags.
+func filterReject(kv *mvccpb.KeyValue) bool {
+	return lookFilter().Reject(kv)
+}
+
+// GetFileWriter opens outputFile for writing, falling back to defaultName.
+func GetFileWriter(outputFile, defaultName string) *os.File {
+	name := outputFile
+	if name == "" {
+		name = defaultName
+	}
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		core.Exit(err)
 	}
