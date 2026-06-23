@@ -31,13 +31,22 @@ func NewFindCmd() *cobra.Command {
 	cmd.Flags().StringVar(&findKey, "match-key", "", "Show the data like the match key")
 	cmd.Flags().StringVar(&findPrefix, "prefix", "", "Show the data like the prefix")
 	cmd.Flags().BoolVar(&containValue, "value", false, "Show the value or not")
-	cmd.Flags().IntVar(&findLimit, "limit", 10, "The limit of the show keys")
+	cmd.Flags().IntVar(&findLimit, "limit", 10, "The limit of the show keys (pushed down to the etcd server as a Range limit)")
 	return cmd
 }
 
 func findFunc(cmd *cobra.Command, args []string) {
 	core.InitClient()
-	resp, datac := core.GetDataWithPrefix(findPrefix)
+	// --limit is pushed down to the server via WithLimit: the etcd Range
+	// request is capped at findLimit keys instead of the client truncating a
+	// full scan. --match-key remains a client-side substring filter applied on
+	// top of the capped result.
+	var opts []core.ScanOption
+	if findPrefix != "" {
+		opts = append(opts, core.WithPrefix(findPrefix))
+	}
+	opts = append(opts, core.WithLimit(int64(findLimit)))
+	resp, datac := core.ScanData(opts...)
 	appendBufferForFind(resp, datac, os.Stdout)
 }
 
