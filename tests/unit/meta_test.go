@@ -231,3 +231,28 @@ func TestFormatLogLine_WithRevCount(t *testing.T) {
 		t.Errorf("missing tombstone_count=3: %s", line)
 	}
 }
+
+func TestFilterMetasByPrefix(t *testing.T) {
+	metas := []core.KeyMeta{
+		{Key: "/registry/events/kyuubi/a"},
+		{Key: "/registry/events/kyuubi/b"},
+		{Key: "/registry/events/starrocks/c"},
+		{Key: "/registry/pods/default/nginx"},
+	}
+	cases := []struct {
+		prefix string
+		want   int
+	}{
+		{"", 4}, // empty prefix keeps all
+		{"/registry/events/kyuubi", 2},
+		{"/registry/events", 3},
+		{"/registry/pods", 1},
+		{"/registry/configmaps", 0}, // no match
+	}
+	for _, c := range cases {
+		got := core.FilterMetasByPrefix(metas, c.prefix)
+		if len(got) != c.want {
+			t.Errorf("FilterMetasByPrefix(prefix=%q) = %d metas, want %d", c.prefix, len(got), c.want)
+		}
+	}
+}

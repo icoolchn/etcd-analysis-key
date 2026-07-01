@@ -91,9 +91,37 @@ func TestSummarize_TopTruncation(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		metas = append(metas, meta("/p"+string(rune('a'+i))+"/x", 1, 1, 1, 10))
 	}
+	// 10 distinct groups; Top=3 -> 3 shown + 1 synthetic "others" row = 4.
 	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 3, SortBy: "count"})
-	if len(groups) != 3 {
-		t.Errorf("expected top 3, got %d", len(groups))
+	if len(groups) != 4 {
+		t.Fatalf("expected 4 rows (3 top + others), got %d", len(groups))
+	}
+	others := groups[3]
+	if !others.IsOthers() {
+		t.Fatalf("expected 4th row to be others, got %+v", others)
+	}
+	if others.OthersCount != 7 {
+		t.Errorf("expected others to merge 7 dropped groups, got %d", others.OthersCount)
+	}
+	if others.Count != 7 {
+		t.Errorf("expected others count=7, got %d", others.Count)
+	}
+}
+
+func TestSummarize_TopNoTruncationNoOthers(t *testing.T) {
+	metas := []core.KeyMeta{
+		meta("/a/x", 1, 1, 1, 10),
+		meta("/b/x", 1, 1, 1, 10),
+	}
+	// Top=10 but only 2 groups -> no truncation, no others row.
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "count"})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	for _, g := range groups {
+		if g.IsOthers() {
+			t.Errorf("unexpected others row when no truncation: %+v", g)
+		}
 	}
 }
 

@@ -24,6 +24,18 @@ func percentiles(sizes []int, sizeToCount map[int]int) (data []int) {
 		}
 		cur += c
 	}
+	// Tail fill: when the loop exits with high percentiles still unset (small
+	// input or many duplicate max values that skip several thresholds at once),
+	// backfill them with the largest size seen. Otherwise p95/p99 render as 0
+	// for small datasets, which is misleading.
+	if len(sizes) > 0 {
+		maxSize := sizes[len(sizes)-1]
+		for ; j < len(pctls); j++ {
+			if data[j] == 0 {
+				data[j] = maxSize
+			}
+		}
+	}
 	return data
 }
 

@@ -12,6 +12,32 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "etcdctl+",
 	Short: "etcd data analysis tool",
+	Long: `etcd data analysis tool.
+
+Two modes:
+
+  Online (default): connect to etcd via --endpoints and scan live.
+      etcdctl+ summary --group-depth=2 --sort=count --top=20
+      etcdctl+ distribute --type=kv
+      etcdctl+ find --match-key=starrocks
+
+  Offline: analyze without contacting etcd. Two offline inputs:
+    - summary / distribute / find: read a KeyMeta JSONL exported by
+      'look --write-out=jsonl' (one analysis pass exports, many commands reuse):
+        etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=keys.jsonl
+        etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=count
+        etcdctl+ distribute --input=keys.jsonl --type=kv
+        etcdctl+ find --input=keys.jsonl --match-key=starrocks
+    - look: parse a bbolt snapshot db directly (single pass, all fields
+      including rev_count / tombstone_count):
+        etcdctl+ look --snapshot=cluster.db
+
+Offline is recommended for large clusters and batch inspection: snapshot once,
+analyze many times, no sustained follower read pressure. Online is fine for
+small clusters or ad-hoc queries.
+
+Use <command> -h to see the flags each subcommand supports.
+`,
 }
 
 func Start() {

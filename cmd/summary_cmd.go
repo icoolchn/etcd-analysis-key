@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/SimFG/etcd-analysis/core"
@@ -142,11 +144,21 @@ func summaryFunc(cmd *cobra.Command, args []string) {
 // collectMetas gathers KeyMeta records either from a JSONL file (offline) or
 // by scanning etcd (online). Size filtering (online) happens here; offline
 // filtering is applied by the caller via core.FilterMetas.
+//
+// Offline prefix filtering: when --input and --prefix are both set, records
+// whose key does not start with --prefix are dropped here. Without this, the
+// offline branch would silently ignore --prefix (the online branch pushes it
+// to the server via WithPrefix), making drill-down like
+// `summary --input=keys.jsonl --prefix=/registry/events/kyuubi` a no-op.
 func collectMetas() ([]core.KeyMeta, error) {
 	fc := core.FilterConfig{Attribute: summaryFilter, Min: summaryFilterMin, Max: summaryFilterMax}
 
 	if summaryInput != "" {
-		return core.ReadJSONL(summaryInput)
+		metas, err := core.ReadJSONL(summaryInput)
+		if err != nil {
+			return nil, err
+		}
+		return core.FilterMetasByPrefix(metas, summaryPrefix), nil
 	}
 
 	core.InitClient()
@@ -175,7 +187,18 @@ func collectMetas() ([]core.KeyMeta, error) {
 }
 
 func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
-	fmt.Fprintf(out, "Summary: %d keys, %d groups (top %d by %s)\n", total, len(groups), len(groups), summarySort)
+	shown := len(groups)
+	others := 0
+	if shown > 0 && groups[shown-1].IsOthers() {
+		others = groups[shown-1].OthersCount
+		shown--
+	}
+	groupsLabel := formatThousands(total)
+	if others > 0 {
+		groupsLabel = fmt.Sprintf("%d (top %d + %d others)", total, shown, others)
+	}
+	fmt.Fprintf(out, "Summary: %s keys, %s groups by %s\n",
+		formatThousands(total), groupsLabel, summarySort)
 	fmt.Fprintln(out)
 
 	hasRevCount := false
@@ -185,48 +208,140 @@ func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 			break
 		}
 	}
-
-	if hasRevCount {
-		fmt.Fprintln(out, "Group | Count | TotalSize | AvgSize | MaxSize | MaxVersion | LatestModRev | CreatedCount | ModifiedCount | RevCount | TombstoneCount")
-	} else {
-		fmt.Fprintln(out, "Group | Count | TotalSize | AvgSize | MaxSize | MaxVersion | LatestModRev | CreatedCount | ModifiedCount")
-	}
 	hasSize := len(groups) > 0 && groups[0].HasSize
+
+	// percent is only meaningful for additive sort dims (count / total-size).
+	// For other dims we render "-" per the display template 3.2 percent rules.
+	showPercent := summarySort == "count" || summarySort == "total-size"
+
+	// Totals for percent. groups already includes the "others" row (whose
+	// Count/TotalSize already aggregate the dropped tail), so summing here
+	// yields the true full-set totals.
+	var totalCount int
+	var totalSize int64
 	for _, g := range groups {
-		if hasSize {
-			base := fmt.Sprintf("%s | %d | %s | %s | %s | %d | %d | %d | %d",
-				g.Group, g.Count,
-				core.ReadableSize(int(g.TotalSize)), core.ReadableSize(int(g.AvgSize())), core.ReadableSize(int(g.MaxSize)),
-				g.MaxVersion, g.LatestModRevision, g.CreatedCount, g.ModifiedCount)
-			if hasRevCount {
-				base += fmt.Sprintf(" | %d | %d", g.RevCount, g.TombstoneCount)
+		totalCount += g.Count
+		totalSize += g.TotalSize
+	}
+
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	header := "prefix\tcount\ttotal_size\tavg_size\tmax_size\tmax_version\tlatest_mod_revision\tcreated_count\tmodified_count"
+	if hasRevCount {
+		header += "\trev_count\ttombstone_count"
+	}
+	if showPercent {
+		header += "\tpercent"
+	}
+	fmt.Fprintln(tw, header)
+
+	for _, g := range groups {
+		count := formatThousands(g.Count)
+		totalSizeStr := "-"
+		avgStr := "-"
+		maxStr := "-"
+		maxVer := "-"
+		latestMod := "-"
+		createdStr := "-"
+		modifiedStr := "-"
+		revStr := "-"
+		tombStr := "-"
+
+		if g.IsOthers() {
+			// others row: only additive aggregates are meaningful (template 3.2).
+			if hasSize {
+				totalSizeStr = core.ReadableSize(int(g.TotalSize))
 			}
-			fmt.Fprintln(out, base)
+			createdStr = formatThousands(int(g.CreatedCount))
+			modifiedStr = formatThousands(int(g.ModifiedCount))
+			if hasRevCount {
+				revStr = formatThousands(int(g.RevCount))
+				tombStr = formatThousands(int(g.TombstoneCount))
+			}
 		} else {
-			base := fmt.Sprintf("%s | %d | - | - | - | %d | %d | %d | %d",
-				g.Group, g.Count,
-				g.MaxVersion, g.LatestModRevision, g.CreatedCount, g.ModifiedCount)
-			if hasRevCount {
-				base += fmt.Sprintf(" | %d | %d", g.RevCount, g.TombstoneCount)
+			if hasSize {
+				totalSizeStr = core.ReadableSize(int(g.TotalSize))
+				avgStr = core.ReadableSize(int(g.AvgSize()))
+				maxStr = core.ReadableSize(int(g.MaxSize))
 			}
-			fmt.Fprintln(out, base)
+			maxVer = fmt.Sprintf("%d", g.MaxVersion)
+			latestMod = fmt.Sprintf("%d", g.LatestModRevision)
+			createdStr = formatThousands(int(g.CreatedCount))
+			modifiedStr = formatThousands(int(g.ModifiedCount))
+			if hasRevCount {
+				revStr = fmt.Sprintf("%d", g.RevCount)
+				tombStr = fmt.Sprintf("%d", g.TombstoneCount)
+			}
+		}
+
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+			g.Group, count, totalSizeStr, avgStr, maxStr, maxVer, latestMod, createdStr, modifiedStr)
+		if hasRevCount {
+			row += fmt.Sprintf("\t%s\t%s", revStr, tombStr)
+		}
+		if showPercent {
+			row += "\t" + percentStr(g, totalCount, totalSize)
+		}
+		fmt.Fprintln(tw, row)
+	}
+	tw.Flush()
+}
+
+// percentStr renders the percent column for one group per template 3.2:
+// count sort -> group_count/total_count; total-size sort -> group_size/total_size.
+func percentStr(g core.GroupStats, totalCount int, totalSize int64) string {
+	if summarySort == "count" {
+		if totalCount == 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.1f%%", float64(g.Count)*100.0/float64(totalCount))
+	}
+	if summarySort == "total-size" {
+		if totalSize == 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.1f%%", float64(g.TotalSize)*100.0/float64(totalSize))
+	}
+	return "-"
+}
+
+// formatThousands renders an int with thousands separators (e.g. 1936675 -> 1,936,675).
+func formatThousands(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	pre := len(s) % 3
+	if pre > 0 {
+		b.WriteString(s[:pre])
+		if len(s) > pre {
+			b.WriteByte(',')
 		}
 	}
+	for i := pre; i < len(s); i += 3 {
+		b.WriteString(s[i : i+3])
+		if i+3 < len(s) {
+			b.WriteByte(',')
+		}
+	}
+	return b.String()
 }
 
 func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 	type groupOut struct {
-		Group             string `json:"group"`
-		Count             int    `json:"count"`
-		TotalSize         int64  `json:"total_size_bytes"`
-		AvgSize           int64  `json:"avg_size_bytes"`
-		MaxSize           int64  `json:"max_size_bytes"`
-		MaxVersion        int64  `json:"max_version"`
-		LatestModRevision int64  `json:"latest_mod_revision"`
-		CreatedCount      int64  `json:"created_count"`
-		ModifiedCount     int64  `json:"modified_count"`
-		RevCount          int64  `json:"rev_count,omitempty"`
-		TombstoneCount    int64  `json:"tombstone_count,omitempty"`
+		Group             string  `json:"group"`
+		Count             int     `json:"count"`
+		TotalSize         int64   `json:"total_size_bytes"`
+		AvgSize           int64   `json:"avg_size_bytes"`
+		MaxSize           int64   `json:"max_size_bytes"`
+		MaxVersion        int64   `json:"max_version"`
+		LatestModRevision int64   `json:"latest_mod_revision"`
+		CreatedCount      int64   `json:"created_count"`
+		ModifiedCount     int64   `json:"modified_count"`
+		RevCount          int64   `json:"rev_count,omitempty"`
+		TombstoneCount    int64   `json:"tombstone_count,omitempty"`
+		Percent           float64 `json:"percent,omitempty"`
+		IsOthers          bool    `json:"is_others,omitempty"`
 	}
 	type report struct {
 		Total int        `json:"total_keys"`
@@ -235,9 +350,18 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 		Rows  []groupOut `json:"rows"`
 	}
 
+	// Totals for percent. groups already includes the "others" row whose
+	// Count/TotalSize aggregate the dropped tail.
+	var totalCount int
+	var totalSize int64
+	for _, g := range groups {
+		totalCount += g.Count
+		totalSize += g.TotalSize
+	}
+
 	rows := make([]groupOut, 0, len(groups))
 	for _, g := range groups {
-		rows = append(rows, groupOut{
+		row := groupOut{
 			Group:             g.Group,
 			Count:             g.Count,
 			TotalSize:         g.TotalSize,
@@ -249,7 +373,22 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 			ModifiedCount:     g.ModifiedCount,
 			RevCount:          g.RevCount,
 			TombstoneCount:    g.TombstoneCount,
-		})
+		}
+		if g.IsOthers() {
+			row.IsOthers = true
+			// avg/max/version/revision are not meaningful for the merge row.
+			row.AvgSize = 0
+			row.MaxSize = 0
+			row.MaxVersion = 0
+			row.LatestModRevision = 0
+		}
+		// percent: numeric, no "%" suffix (template 3.2). Only for additive dims.
+		if summarySort == "count" && totalCount > 0 {
+			row.Percent = float64(g.Count) / float64(totalCount)
+		} else if summarySort == "total-size" && totalSize > 0 {
+			row.Percent = float64(g.TotalSize) / float64(totalSize)
+		}
+		rows = append(rows, row)
 	}
 	r := report{Total: total, Sort: summarySort, Top: summaryTop, Rows: rows}
 	b, err := json.MarshalIndent(r, "", "  ")

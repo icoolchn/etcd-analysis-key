@@ -116,6 +116,23 @@ func WriteJSONL(metas []KeyMeta, w io.Writer) error {
 	return bw.Flush()
 }
 
+// FilterMetasByPrefix drops metas whose key does not start with prefix.
+// Used by the offline (--input) path of summary/distribute/find, where the
+// server-side WithPrefix scan is not available; without this, --prefix would
+// be silently ignored in offline mode. Empty prefix returns metas unchanged.
+func FilterMetasByPrefix(metas []KeyMeta, prefix string) []KeyMeta {
+	if prefix == "" {
+		return metas
+	}
+	filtered := make([]KeyMeta, 0, len(metas))
+	for _, m := range metas {
+		if strings.HasPrefix(m.Key, prefix) {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
 // ReadJSONL reads a JSONL file produced by `look --write-out=jsonl`.
 func ReadJSONL(path string) ([]KeyMeta, error) {
 	f, err := os.Open(path)
