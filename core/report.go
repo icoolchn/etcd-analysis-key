@@ -36,6 +36,10 @@ type Report interface {
 	Run() <-chan string
 	DynamicOutput()
 	JSON() string
+	// String returns the full text rendering (Summary + size histogram +
+	// percentiles). Used by distribute's text output to embed the existing
+	// size-distribution block alongside the Overview / Diagnosis sections.
+	String() string
 }
 
 type SizeOf func(*mvccpb.KeyValue) int

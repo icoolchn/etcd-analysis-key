@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 )
 
 var (
@@ -42,6 +43,28 @@ func ReadableSize(s int) string {
 		sf /= 1024
 	}
 	return fmt.Sprintf("%.1f%s", sf, byteUnits[i])
+}
+
+// FormatThousands renders an integer with thousands separators,
+// e.g. 1936675 -> "1,936,675".
+func FormatThousands(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	pre := len(s) % 3
+	var b strings.Builder
+	if pre > 0 {
+		b.WriteString(s[:pre])
+		b.WriteByte(',')
+	}
+	for i := pre; i < len(s); i += 3 {
+		b.WriteString(s[i : i+3])
+		if i+3 < len(s) {
+			b.WriteByte(',')
+		}
+	}
+	return b.String()
 }
 
 func Interrupt(f func()) {

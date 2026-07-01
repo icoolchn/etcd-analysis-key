@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -29,7 +30,16 @@ type GroupStats struct {
 	ModifiedCount     int64 // keys whose mod_revision is within [min,max] bounds
 	RevCount          int64 // sum of rev_count (offline snapshot only)
 	TombstoneCount    int64 // sum of tombstone_count (offline snapshot only)
+
+	// OthersCount is the number of dropped groups merged into this "others" row.
+	// It is 0 for normal rows; >0 only for the synthetic others row appended by
+	// Summarize when --top truncates the result. Per template 3.2, avg_size /
+	// max_version / max_mod_revision render as "-" for the others row.
+	OthersCount int
 }
+
+// IsOthers reports whether this row is the synthetic "others" merge row.
+func (g GroupStats) IsOthers() bool { return g.OthersCount > 0 }
 
 // AvgSize returns the mean kv_size for the group, or 0 when sizes unknown.
 func (g GroupStats) AvgSize() int64 {
@@ -142,7 +152,25 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 	sortGroups(result, cfg.SortBy)
 
 	if cfg.Top < len(result) {
-		result = result[:cfg.Top]
+		// Build the synthetic "others" row: merge the dropped tail groups so the
+		// user can see the aggregated count/size of the long tail at a glance
+		// (template 3.2 / 3.3 "others (X prefixes)" row). avg_size / max_size /
+		// max_version / max_mod_revision are left to the caller to render as "-".
+		dropped := result[cfg.Top:]
+		others := GroupStats{OthersCount: len(dropped)}
+		if len(dropped) > 0 && dropped[0].HasSize {
+			others.HasSize = true
+		}
+		for _, g := range dropped {
+			others.Count += g.Count
+			others.TotalSize += g.TotalSize
+			others.CreatedCount += g.CreatedCount
+			others.ModifiedCount += g.ModifiedCount
+			others.RevCount += g.RevCount
+			others.TombstoneCount += g.TombstoneCount
+		}
+		others.Group = fmt.Sprintf("others (%d)", len(dropped))
+		result = append(result[:cfg.Top], others)
 	}
 	return result
 }
