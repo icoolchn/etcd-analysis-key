@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	distributeType     string
-	bucketCount        int
-	distributeWriteOut string
-	distributePrefix   string
-	distributePageSize int
+	distributeType      string
+	bucketCount         int
+	distributeWriteOut  string
+	distributePrefix    string
+	distributeInput     string
+	distributePageSize  int
 	distributePageSleep time.Duration
 )
 
@@ -71,6 +72,7 @@ Size distribution:
 	cmd.Flags().StringVar(&distributeType, "type", "key", "Distribution basis; key, value or kv")
 	cmd.Flags().IntVar(&bucketCount, "bucket", 5, "Bucket Count")
 	cmd.Flags().StringVar(&distributeWriteOut, "write-out", "text", "Output format: text or json")
+	cmd.Flags().StringVar(&distributeInput, "input", "", "KeyMeta JSONL file (offline mode); empty means online scan")
 	cmd.Flags().StringVar(&distributePrefix, "prefix", "", "Only scan keys with the given prefix (server-side)")
 	cmd.Flags().IntVar(&distributePageSize, "page-size", core.DefaultPageSize(), "Per-request page size")
 	cmd.Flags().DurationVar(&distributePageSleep, "page-sleep", 0, "Sleep between pages, e.g. 50ms")
@@ -86,6 +88,13 @@ Size distribution:
 }
 
 func distributeFunc(cmd *cobra.Command, args []string) {
+	isJSON := distributeWriteOut == "json"
+
+	if distributeInput != "" {
+		distributeFromJSONL(isJSON)
+		return
+	}
+
 	core.InitClient()
 	scanOpts := []core.ScanOption{core.WithPageSize(distributePageSize)}
 	if distributePrefix != "" {
@@ -109,9 +118,6 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	isJSON := distributeWriteOut == "json"
-
-	// Build report with appropriate options
 	var r core.Report
 	if isJSON {
 		r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
@@ -119,7 +125,6 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 		r = core.NewReport(bucketCount, sizeOf)
 	}
 
-	// Common data pipeline
 	c1 := r.Results()
 	go func() {
 		defer close(c1)
@@ -132,7 +137,65 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 	}()
 	<-r.Run()
 
-	// Output
+	if isJSON {
+		fmt.Println(r.JSON())
+	}
+}
+
+// distributeFromJSONL runs distribute from a JSONL file (offline mode).
+func distributeFromJSONL(isJSON bool) {
+	metas, err := core.ReadJSONL(distributeInput)
+	if err != nil {
+		core.Exit(err)
+	}
+
+	metaSizeOf := func(m core.KeyMeta) int {
+		switch distributeType {
+		case "value":
+			return int(m.ValueSize())
+		case "kv":
+			s := m.KvSize()
+			if s < 0 {
+				return 0
+			}
+			return int(s)
+		case "key":
+			fallthrough
+		default:
+			return m.KeySizeBytes
+		}
+	}
+
+	sizeOf := func(kv *mvccpb.KeyValue) int { return len(kv.Key) }
+	var r core.Report
+	if isJSON {
+		r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
+	} else {
+		r = core.NewReport(bucketCount, sizeOf)
+	}
+
+	c1 := r.Results()
+	go func() {
+		defer close(c1)
+		batch := make([]*mvccpb.KeyValue, 0, 1000)
+		for _, m := range metas {
+			size := metaSizeOf(m)
+			kv := &mvccpb.KeyValue{
+				Key:   make([]byte, size),
+				Value: nil,
+			}
+			batch = append(batch, kv)
+			if len(batch) >= 1000 {
+				c1 <- batch
+				batch = make([]*mvccpb.KeyValue, 0, 1000)
+			}
+		}
+		if len(batch) > 0 {
+			c1 <- batch
+		}
+	}()
+	<-r.Run()
+
 	if isJSON {
 		fmt.Println(r.JSON())
 	}

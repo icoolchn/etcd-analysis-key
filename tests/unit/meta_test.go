@@ -123,6 +123,81 @@ func TestKeyMeta_JSONL_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestSnapshotKVToMeta(t *testing.T) {
+	kv := &mvccpb.KeyValue{
+		Key: []byte("/snap/k"), Value: []byte("data"),
+		CreateRevision: 10, ModRevision: 20, Version: 3, Lease: 5,
+	}
+	m := core.SnapshotKVToMeta(kv, 7, 2)
+	if m.Key != "/snap/k" {
+		t.Errorf("key = %q", m.Key)
+	}
+	if m.KeySizeBytes != 7 {
+		t.Errorf("key_size = %d, want 7", m.KeySizeBytes)
+	}
+	if m.ValueSizeBytes == nil || *m.ValueSizeBytes != 4 {
+		t.Errorf("value_size = %v, want 4", m.ValueSizeBytes)
+	}
+	if m.KvSizeBytes == nil || *m.KvSizeBytes != 11 {
+		t.Errorf("kv_size = %v, want 11", m.KvSizeBytes)
+	}
+	if m.RevCount == nil || *m.RevCount != 7 {
+		t.Errorf("rev_count = %v, want 7", m.RevCount)
+	}
+	if m.TombstoneCount == nil || *m.TombstoneCount != 2 {
+		t.Errorf("tombstone_count = %v, want 2", m.TombstoneCount)
+	}
+	if m.Value == nil || *m.Value != "-" {
+		t.Errorf("value = %v, want '-'", m.Value)
+	}
+	if m.Lease != 5 {
+		t.Errorf("lease = %d, want 5", m.Lease)
+	}
+}
+
+func TestKeyMeta_JSONL_RevCountTombstoneCount(t *testing.T) {
+	kv := &mvccpb.KeyValue{Key: []byte("/x"), Value: []byte("y"), CreateRevision: 1, ModRevision: 2, Version: 1}
+	m := core.SnapshotKVToMeta(kv, 5, 3)
+
+	var buf bytes.Buffer
+	if err := core.WriteJSONL([]core.KeyMeta{m}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	line := buf.String()
+	if !strings.Contains(line, `"rev_count":5`) {
+		t.Errorf("JSONL should contain rev_count: %s", line)
+	}
+	if !strings.Contains(line, `"tombstone_count":3`) {
+		t.Errorf("JSONL should contain tombstone_count: %s", line)
+	}
+
+	var parsed core.KeyMeta
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.RevCount == nil || *parsed.RevCount != 5 {
+		t.Errorf("parsed rev_count = %v, want 5", parsed.RevCount)
+	}
+	if parsed.TombstoneCount == nil || *parsed.TombstoneCount != 3 {
+		t.Errorf("parsed tombstone_count = %v, want 3", parsed.TombstoneCount)
+	}
+}
+
+func TestKeyMeta_JSONL_OmitsRevCountWhenNil(t *testing.T) {
+	m := core.KVToMeta(&mvccpb.KeyValue{Key: []byte("k"), Value: []byte("v")}, false, false)
+	var buf bytes.Buffer
+	if err := core.WriteJSONL([]core.KeyMeta{m}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	line := buf.String()
+	if strings.Contains(line, "rev_count") {
+		t.Errorf("online KVToMeta should not have rev_count: %s", line)
+	}
+	if strings.Contains(line, "tombstone_count") {
+		t.Errorf("online KVToMeta should not have tombstone_count: %s", line)
+	}
+}
+
 func TestFormatLogLine_FullAndKeysOnly(t *testing.T) {
 	full := core.KVToMeta(&mvccpb.KeyValue{Key: []byte("k"), Value: []byte("hello")}, false, false)
 	fullLine := core.FormatLogLine(full)
@@ -142,5 +217,17 @@ func TestFormatLogLine_FullAndKeysOnly(t *testing.T) {
 	}
 	if !strings.Contains(koLine, "key_size_bytes=1") {
 		t.Errorf("keys-only log line missing key_size_bytes=1: %s", koLine)
+	}
+}
+
+func TestFormatLogLine_WithRevCount(t *testing.T) {
+	kv := &mvccpb.KeyValue{Key: []byte("k"), Value: []byte("v"), CreateRevision: 1, ModRevision: 2, Version: 1}
+	m := core.SnapshotKVToMeta(kv, 10, 3)
+	line := core.FormatLogLine(m)
+	if !strings.Contains(line, "rev_count=10") {
+		t.Errorf("missing rev_count=10: %s", line)
+	}
+	if !strings.Contains(line, "tombstone_count=3") {
+		t.Errorf("missing tombstone_count=3: %s", line)
 	}
 }

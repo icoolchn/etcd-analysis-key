@@ -68,7 +68,7 @@ before aggregation (client-side; does not reduce server traffic in online mode).
 	cmd.Flags().StringVar(&summaryPrefix, "prefix", "", "Online mode: only scan keys with the given prefix")
 	cmd.Flags().IntVar(&summaryGroupDepth, "group-depth", 2, "Group by first N path segments")
 	cmd.Flags().IntVar(&summaryTop, "top", 20, "Number of prefix groups to output")
-	cmd.Flags().StringVar(&summarySort, "sort", "count", "Sort key: count, total-size, avg-size, max-size, max-version, latest-mod-revision, created-count, modified-count")
+	cmd.Flags().StringVar(&summarySort, "sort", "count", "Sort key: count, total-size, avg-size, max-size, max-version, latest-mod-revision, created-count, modified-count, rev-count, tombstone-count")
 	cmd.Flags().IntVar(&summaryPageSize, "page-size", core.DefaultPageSize(), "Online mode: per-request page size")
 	cmd.Flags().DurationVar(&summaryPageSleep, "page-sleep", 0, "Online mode: sleep between pages, e.g. 50ms")
 
@@ -85,7 +85,7 @@ before aggregation (client-side; does not reduce server traffic in online mode).
 	cmd.Flags().StringVar(&summaryOutput, "output", "", "Write output to file instead of stdout")
 
 	cmd.RegisterFlagCompletionFunc("sort", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-		return []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count"}, cobra.ShellCompDirectiveDefault
+		return []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "rev-count", "tombstone-count"}, cobra.ShellCompDirectiveDefault
 	})
 	cmd.RegisterFlagCompletionFunc("write-out", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		return []string{"text", "json"}, cobra.ShellCompDirectiveDefault
@@ -177,18 +177,39 @@ func collectMetas() ([]core.KeyMeta, error) {
 func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 	fmt.Fprintf(out, "Summary: %d keys, %d groups (top %d by %s)\n", total, len(groups), len(groups), summarySort)
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "Group | Count | TotalSize | AvgSize | MaxSize | MaxVersion | LatestModRev | CreatedCount | ModifiedCount")
+
+	hasRevCount := false
+	for _, g := range groups {
+		if g.RevCount > 0 || g.TombstoneCount > 0 {
+			hasRevCount = true
+			break
+		}
+	}
+
+	if hasRevCount {
+		fmt.Fprintln(out, "Group | Count | TotalSize | AvgSize | MaxSize | MaxVersion | LatestModRev | CreatedCount | ModifiedCount | RevCount | TombstoneCount")
+	} else {
+		fmt.Fprintln(out, "Group | Count | TotalSize | AvgSize | MaxSize | MaxVersion | LatestModRev | CreatedCount | ModifiedCount")
+	}
 	hasSize := len(groups) > 0 && groups[0].HasSize
 	for _, g := range groups {
 		if hasSize {
-			fmt.Fprintf(out, "%s | %d | %s | %s | %s | %d | %d | %d | %d\n",
+			base := fmt.Sprintf("%s | %d | %s | %s | %s | %d | %d | %d | %d",
 				g.Group, g.Count,
 				core.ReadableSize(int(g.TotalSize)), core.ReadableSize(int(g.AvgSize())), core.ReadableSize(int(g.MaxSize)),
 				g.MaxVersion, g.LatestModRevision, g.CreatedCount, g.ModifiedCount)
+			if hasRevCount {
+				base += fmt.Sprintf(" | %d | %d", g.RevCount, g.TombstoneCount)
+			}
+			fmt.Fprintln(out, base)
 		} else {
-			fmt.Fprintf(out, "%s | %d | - | - | - | %d | %d | %d | %d\n",
+			base := fmt.Sprintf("%s | %d | - | - | - | %d | %d | %d | %d",
 				g.Group, g.Count,
 				g.MaxVersion, g.LatestModRevision, g.CreatedCount, g.ModifiedCount)
+			if hasRevCount {
+				base += fmt.Sprintf(" | %d | %d", g.RevCount, g.TombstoneCount)
+			}
+			fmt.Fprintln(out, base)
 		}
 	}
 }
@@ -204,6 +225,8 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 		LatestModRevision int64  `json:"latest_mod_revision"`
 		CreatedCount      int64  `json:"created_count"`
 		ModifiedCount     int64  `json:"modified_count"`
+		RevCount          int64  `json:"rev_count,omitempty"`
+		TombstoneCount    int64  `json:"tombstone_count,omitempty"`
 	}
 	type report struct {
 		Total int        `json:"total_keys"`
@@ -224,6 +247,8 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 			LatestModRevision: g.LatestModRevision,
 			CreatedCount:      g.CreatedCount,
 			ModifiedCount:     g.ModifiedCount,
+			RevCount:          g.RevCount,
+			TombstoneCount:    g.TombstoneCount,
 		})
 	}
 	r := report{Total: total, Sort: summarySort, Top: summaryTop, Rows: rows}

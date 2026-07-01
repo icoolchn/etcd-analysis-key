@@ -23,6 +23,7 @@ var (
 
 	keysOnly bool
 	lookPrefix string
+	lookSnapshot string
 	pageSize  int
 	pageSleep time.Duration
 
@@ -60,6 +61,12 @@ Combination rules:
   --keys-only --filter=none|key : allowed
   --keys-only --filter=value|kv : NOT allowed (no value to size)
   --keys-only --show-value      : NOT allowed (semantic conflict)
+
+Offline mode:
+  --snapshot <db>  Parse a bbolt snapshot db file offline.
+                   Outputs all fields in a single pass: key/value sizes,
+                   rev_count, tombstone_count. No cluster connection needed.
+                   --keys-only is ignored (always full fields).
 `,
 		Run: lookFunc,
 	}
@@ -73,8 +80,9 @@ Combination rules:
 	cmd.Flags().IntVar(&filterMax, "filter-max", -1, "The filter max value")
 	cmd.Flags().IntVar(&filterMin, "filter-min", -1, "The filter min value")
 
-	cmd.Flags().BoolVar(&keysOnly, "keys-only", false, "Only fetch key metadata (no value); uses etcd WithKeysOnly()")
+	cmd.Flags().BoolVar(&keysOnly, "keys-only", false, "Only fetch key metadata (no value); uses etcd WithKeysOnly() (online only; ignored with --snapshot)")
 	cmd.Flags().StringVar(&lookPrefix, "prefix", "", "Only scan keys with the given prefix (server-side)")
+	cmd.Flags().StringVar(&lookSnapshot, "snapshot", "", "Parse a bbolt snapshot db file offline (outputs all fields in a single pass)")
 	cmd.Flags().IntVar(&pageSize, "page-size", core.DefaultPageSize(), "Per-request page size")
 	cmd.Flags().DurationVar(&pageSleep, "page-sleep", 0, "Sleep between pages, e.g. 50ms")
 
@@ -107,20 +115,6 @@ func lookFilter() core.FilterConfig {
 
 func lookFunc(cmd *cobra.Command, args []string) {
 	validateLookFlags()
-	core.InitClient()
-
-	scanOpts := []core.ScanOption{core.WithPageSize(pageSize)}
-	if lookPrefix != "" {
-		scanOpts = append(scanOpts, core.WithPrefix(lookPrefix))
-	}
-	if keysOnly {
-		scanOpts = append(scanOpts, core.WithKeysOnly())
-	}
-	if pageSleep > 0 {
-		scanOpts = append(scanOpts, core.WithPageSleep(pageSleep))
-	}
-
-	resp, datac := core.ScanData(scanOpts...)
 
 	var writer io.Writer
 	switch writeOut {
@@ -138,6 +132,25 @@ func lookFunc(cmd *cobra.Command, args []string) {
 		writer = os.Stdout
 	}
 
+	if lookSnapshot != "" {
+		lookOffline(writer)
+		return
+	}
+
+	core.InitClient()
+
+	scanOpts := []core.ScanOption{core.WithPageSize(pageSize)}
+	if lookPrefix != "" {
+		scanOpts = append(scanOpts, core.WithPrefix(lookPrefix))
+	}
+	if keysOnly {
+		scanOpts = append(scanOpts, core.WithKeysOnly())
+	}
+	if pageSleep > 0 {
+		scanOpts = append(scanOpts, core.WithPageSleep(pageSleep))
+	}
+
+	resp, datac := core.ScanData(scanOpts...)
 	appendBuffer(resp, datac, writer)
 	if hang && writeOut == "file" {
 		ct := time.Tick(time.Second * time.Duration(hangInterval))
@@ -150,6 +163,63 @@ func lookFunc(cmd *cobra.Command, args []string) {
 				fmt.Println(i, "flush...")
 				i++
 			}
+		}
+	}
+}
+
+// lookOffline handles the --snapshot offline mode.
+func lookOffline(writer io.Writer) {
+	var opts []core.SnapshotOption
+	if lookPrefix != "" {
+		opts = append(opts, core.WithSnapshotPrefix(lookPrefix))
+	}
+	datac, stats, err := core.SnapshotSource(lookSnapshot, opts...)
+	if err != nil {
+		core.Exit(err)
+	}
+
+	if isJSONL() {
+		drainSnapshotJSONL(datac, stats, writer)
+		return
+	}
+
+	var buffer bytes.Buffer
+	if !isLog() {
+		buffer.WriteString("Snapshot Analysis\n")
+		buffer.WriteString(fmt.Sprintf("  Source: %s\n", lookSnapshot))
+		buffer.WriteString("Kv List\n")
+	}
+
+	for data := range datac {
+		for _, kv := range data {
+			if filterReject(kv) {
+				continue
+			}
+			key := string(kv.Key)
+			s := stats[key]
+			m := core.SnapshotKVToMeta(kv, s.RevCount, s.TombstoneCount)
+			if isLog() {
+				buffer.WriteString(core.FormatLogLine(m))
+				buffer.WriteByte('\n')
+			} else {
+				buffer.WriteString(formatTableRow(m))
+			}
+		}
+	}
+	buffer.WriteTo(writer)
+}
+
+// drainSnapshotJSONL streams snapshot KVs as JSONL with rev_count/tombstone_count.
+func drainSnapshotJSONL(datac <-chan []*mvccpb.KeyValue, stats map[string]*core.KeyStats, writer io.Writer) {
+	for data := range datac {
+		for _, kv := range data {
+			if filterReject(kv) {
+				continue
+			}
+			key := string(kv.Key)
+			s := stats[key]
+			m := core.SnapshotKVToMeta(kv, s.RevCount, s.TombstoneCount)
+			fmt.Fprintln(writer, jsonlLine(m))
 		}
 	}
 }

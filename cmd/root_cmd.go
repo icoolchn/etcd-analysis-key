@@ -42,5 +42,8 @@ func init() {
 	// rootCmd.AddCommand(NewRenameCmd())  // 🟠 non-atomic Get→Put→Delete, may cause inconsistency
 	rootCmd.AddCommand(NewUnmarshalCmd())
 	rootCmd.AddCommand(NewSummaryCmd())
+	rootCmd.AddCommand(NewWalLookCmd())
+	rootCmd.AddCommand(NewWalSummaryCmd())
+	rootCmd.AddCommand(NewDumpCmd())
 	rootCmd.AddCommand(cobracompletefig.CreateCompletionSpecCommand())
 }

@@ -25,6 +25,8 @@ type KeyMeta struct {
 	ModRevision    int64   `json:"mod_revision"`
 	Version        int64   `json:"version"`
 	Lease          int64   `json:"lease"`
+	RevCount       *int    `json:"rev_count,omitempty"`
+	TombstoneCount *int    `json:"tombstone_count,omitempty"`
 }
 
 // KVToMeta builds a KeyMeta from an etcd KeyValue. In keys-only mode value and
@@ -53,6 +55,28 @@ func KVToMeta(kv *mvccpb.KeyValue, keysOnly bool, showValue bool) KeyMeta {
 	ks := len(kv.Key) + len(kv.Value)
 	m.KvSizeBytes = &ks
 	return m
+}
+
+// SnapshotKVToMeta builds a KeyMeta from an offline snapshot KV with full
+// fields: value size is always present, and rev_count/tombstone_count are
+// included from the single-pass aggregation.
+func SnapshotKVToMeta(kv *mvccpb.KeyValue, revCount, tombstoneCount int) KeyMeta {
+	vs := len(kv.Value)
+	ks := len(kv.Key) + len(kv.Value)
+	v := "-"
+	return KeyMeta{
+		Key:            string(kv.Key),
+		Value:          &v,
+		KeySizeBytes:   len(kv.Key),
+		ValueSizeBytes: &vs,
+		KvSizeBytes:    &ks,
+		CreateRevision: kv.CreateRevision,
+		ModRevision:    kv.ModRevision,
+		Version:        kv.Version,
+		Lease:          kv.Lease,
+		RevCount:       &revCount,
+		TombstoneCount: &tombstoneCount,
+	}
 }
 
 // HasValue reports whether size fields are populated (i.e. not keys-only).
@@ -123,14 +147,23 @@ func ReadJSONL(path string) ([]KeyMeta, error) {
 // format with the split size fields. In keys-only mode value/value_size/
 // kv_size are omitted.
 func FormatLogLine(m KeyMeta) string {
+	var base string
 	if m.HasValue() {
-		return fmt.Sprintf("key=%s value=%s key_size_bytes=%d value_size_bytes=%d kv_size_bytes=%d kv_size_human=%s create_revision=%d mod_revision=%d version=%d lease=%d",
+		base = fmt.Sprintf("key=%s value=%s key_size_bytes=%d value_size_bytes=%d kv_size_bytes=%d kv_size_human=%s create_revision=%d mod_revision=%d version=%d lease=%d",
 			m.Key, valStr(m.Value),
 			m.KeySizeBytes, *m.ValueSizeBytes, *m.KvSizeBytes, ReadableSize(*m.KvSizeBytes),
 			m.CreateRevision, m.ModRevision, m.Version, m.Lease)
+	} else {
+		base = fmt.Sprintf("key=%s key_size_bytes=%d create_revision=%d mod_revision=%d version=%d lease=%d",
+			m.Key, m.KeySizeBytes, m.CreateRevision, m.ModRevision, m.Version, m.Lease)
 	}
-	return fmt.Sprintf("key=%s key_size_bytes=%d create_revision=%d mod_revision=%d version=%d lease=%d",
-		m.Key, m.KeySizeBytes, m.CreateRevision, m.ModRevision, m.Version, m.Lease)
+	if m.RevCount != nil {
+		base += fmt.Sprintf(" rev_count=%d", *m.RevCount)
+	}
+	if m.TombstoneCount != nil {
+		base += fmt.Sprintf(" tombstone_count=%d", *m.TombstoneCount)
+	}
+	return base
 }
 
 func valStr(v *string) string {

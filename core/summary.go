@@ -27,6 +27,8 @@ type GroupStats struct {
 	LatestModRevision int64
 	CreatedCount      int64 // keys whose create_revision is within [min,max] bounds
 	ModifiedCount     int64 // keys whose mod_revision is within [min,max] bounds
+	RevCount          int64 // sum of rev_count (offline snapshot only)
+	TombstoneCount    int64 // sum of tombstone_count (offline snapshot only)
 }
 
 // AvgSize returns the mean kv_size for the group, or 0 when sizes unknown.
@@ -47,6 +49,8 @@ var summarySortKeys = map[string]bool{
 	"latest-mod-revision": true,
 	"created-count":       true,
 	"modified-count":      true,
+	"rev-count":           true,
+	"tombstone-count":     true,
 }
 
 // ValidSortKey reports whether key is a supported --sort value.
@@ -122,6 +126,12 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 		if inRange(m.ModRevision, cfg.MinModRevision, cfg.MaxModRevision) {
 			gs.ModifiedCount++
 		}
+		if m.RevCount != nil {
+			gs.RevCount += int64(*m.RevCount)
+		}
+		if m.TombstoneCount != nil {
+			gs.TombstoneCount += int64(*m.TombstoneCount)
+		}
 	}
 
 	result := make([]GroupStats, 0, len(order))
@@ -173,6 +183,10 @@ func sortGroups(gs []GroupStats, by string) {
 		less = func(i, j int) bool { return gs[i].CreatedCount > gs[j].CreatedCount }
 	case "modified-count":
 		less = func(i, j int) bool { return gs[i].ModifiedCount > gs[j].ModifiedCount }
+	case "rev-count":
+		less = func(i, j int) bool { return gs[i].RevCount > gs[j].RevCount }
+	case "tombstone-count":
+		less = func(i, j int) bool { return gs[i].TombstoneCount > gs[j].TombstoneCount }
 	}
 	sort.Slice(gs, less)
 }
