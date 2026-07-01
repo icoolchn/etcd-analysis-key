@@ -1,367 +1,152 @@
 # Changelog
 
----
-
-## Phase 1: Initial Fixes
-
-> Commit `d89a6ea` — Fix `WithPrefix` panic, `--key` flag collision, disable high-risk commands.
-
-### Fix 1: etcd client v3.5.0 `WithPrefix` false-positive panic
-
-**Symptoms**
-
-Running `distribute`, `look`, or `find` (without prefix) triggers a panic:
-
-```
-panic: `WithPrefix` and `WithFromKey` cannot be set at the same time, choose one
-```
-
-**Root Cause**
-
-etcd client v3.5.0 uses reflection + `strings.Contains` to detect option types. The function name `GetDataWithPrefix` contains `WithPrefix`, causing all closure variable names within (such as `WithFromKey`, `WithSerializable`, `WithLimit`) to be falsely matched as `WithPrefix`, triggering the conflict detection.
-
-**Fix**
-
-Upgrade etcd client from v3.5.0 to v3.5.27. Since v3.5.15+, options set boolean flags directly inside closures instead of relying on reflection and string matching.
-
-**Files modified:** `go.mod`, `go.sum`
-
-```
-go.etcd.io/etcd/api/v3        v3.5.0  → v3.5.27
-go.etcd.io/etcd/client/pkg/v3 v3.5.0  → v3.5.27
-go.etcd.io/etcd/client/v3     v3.5.0  → v3.5.27
-go directive                   1.18   → 1.24
-```
+This document follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
 ---
 
-### Fix 2: `--key` Flag collision causing TLS handshake failure
+## [Unreleased] — Phase 4: Offline Analysis
 
-**Symptoms**
+> Design doc: `docs/etcd-offline-design/etcd-offline-analysis-design.md`
 
-When connecting to etcd with TLS, `find --key=xxx` and `unmarshal --key=xxx` fail with:
+### Added
 
-```
-tls: failed to verify certificate: x509: "etcd" certificate is not standards compliant
-```
+- **`look --snapshot` offline data source**: Parses bbolt snapshot db file, outputs all fields in a single pass (current-state KV + value size + rev_count + tombstone_count), no cluster connection required
+- **`wal-look` command**: Parses WAL logs, outputs WalOp entries one by one (raft_index/op_type/key/value_size_bytes); supports `--entry-type` filtering, `--start/end-index` range
+- **`wal-summary` command**: Reads WalOp JSONL or parses WAL directly → aggregates Put/Delete counts per key → `--sort=put-count/delete-count` sorted Top N
+- **`dump` command set**: Subcommands `list-bucket` / `iterate-bucket` (+ size enhancement) / `scan-keys` / `wal`, raw plaintext export
+- **`summary --sort=rev-count/tombstone-count`**: New sort dimensions for offline snapshot JSONL, locating historical revision accumulation and frequent-deletion hotspots
+- **`distribute --input` / `find --input`**: Consume KeyMeta JSONL for offline analysis, aligned with `summary --input`
+- **`core/snapshot_source.go`**: `SnapshotSource` single-pass all fields, adapted from `ahrtr/etcd-diagnosis`'s `BytesToBucketKey` (~60 lines)
+- **`core/wal_source.go`**: `WalSource` + `WalOp` struct + all 12 entry-types
+- **`core/revision.go`**: `BytesToBucketKey` + tombstone detection
 
-But `leader`, `distribute`, `look` etc. work fine with TLS.
+### Changed
 
-**Root Cause**
+- **`KeyMeta`** adds `RevCount` / `TombstoneCount` fields, JSONL read/write adapted
+- **`look` help text**: `--keys-only` annotated "online only; ignored with --snapshot"; `--snapshot` notes "outputs all fields in a single pass"
 
-The global PersistentFlag `--key` (TLS private key file) clashes with the subcommand LocalFlag `--key` (search keyword/etcd key). Cobra's subcommand LocalFlag overrides the PersistentFlag, causing the TLS key path to be overwritten with the search keyword string.
+### Design Decisions
 
-```go
-// Global flag
-rootCmd.PersistentFlags().StringVar(&core.C.TLS.KeyFile, "key", "", "TLS key file")
-
-// Subcommand flag (name collision!)
-cmd.Flags().StringVar(&findKey, "key", "", "search keyword")
-cmd.Flags().StringVar(&unmarshallKey, "key", "", "etcd key")
-```
-
-**Trigger Conditions**
-
-Both conditions must be true: 1) TLS connection in use; 2) subcommand uses `--key`
-
-| Scenario | Result |
-|----------|--------|
-| No TLS + `find --key=qa` | OK (global --key is empty, override has no effect) |
-| TLS + `find` (no --key) | OK (global --key not overridden) |
-| TLS + `find --key=qa` | TLS key overwritten to "qa", handshake fails |
-
-**Fix**
-
-Rename the subcommand `--key` flags to avoid collision with the global TLS `--key`.
-
-| Command | Before | After |
-|---------|--------|-------|
-| find | `--key` | `--match-key` |
-| unmarshal | `--key` | `--target-key` |
-
-Naming follows the existing pattern `--source-key`, `--target-key`, `--filter-max`.
-
-**Files modified:** `cmd/find_cmd.go`, `cmd/unmarsha_cmd.go`
+- **Single-pass design**: Offline `--snapshot` does not split into `--keys-only` and `--rev-count` modes; one bbolt traversal performs current-state dedup + rev_count/tombstone_count aggregation simultaneously, time complexity unchanged (O(N))
+- **JSONL pipeline**: `--snapshot` only on the `look` command; other commands consume JSONL via `--input` (load once, analyze many times)
+- **Reference implementation**: Core references `ahrtr/etcd-diagnosis` offline (rev_count analysis), copied rather than imported (v3.6.7 vs v3.5.27 version difference)
+- **Dependency changes**: + `bbolt` (snapshot db) + `server/v3` (only WAL path requires `wal.OpenForRead`)
 
 ---
 
-### Fix 3: Disable high-risk commands
+## [0.3.0] — 2026-06-23 — Phase 3: Online Refactoring
 
-**Reason**
-
-`clear` and `rename` commands pose data security risks:
-
-| Command | Risk Level | Description |
-|---------|-----------|-------------|
-| clear | Critical | Deletes ALL etcd data, irreversible |
-| rename | High | Non-atomic Get→Put→Delete, may cause inconsistency on failure |
-
-**Fix**
-
-Comment out `NewClearCmd()` and `NewRenameCmd()` registration in `root_cmd.go`. Source code is preserved; uncomment to re-enable.
-
-**Files modified:** `cmd/root_cmd.go`
-
----
-
-## Phase 2: JSON Output Feature
-
-> Commit `1f1cc55` (feat) — distribute command adds `--write-out=json` support, outputting machine-readable JSON reports for scripting and automation.
+> Commit `34ff4e2` — Add summary command + shared filter/meta modules + JSONL pipeline + low-risk inspection workflow.
 >
-> Commits `fce35f0`~`0481267` (fix/test) — Based on Code Review feedback, the following fixes were applied and a complete test suite was established.
+> Refactoring plan: see `docs/changelog/etcd-analysis-key-improvement-plan.md`.
+
+### Added
+
+- **`summary` command**: Aggregate Top N by prefix, supports `--group-depth` / `--sort` / `--top` / `--input` (offline JSONL) / `--keys-only` (online) / `--min/max-create/mod-revision`
+- **`look --keys-only`**: Online mode uses `WithKeysOnly()` under the hood, does not fetch values, low-risk snapshot
+- **`look --write-out=jsonl`**: Stream export KeyMeta JSONL for `summary --input` offline multi-pass analysis
+- **`look --prefix` / `distribute --prefix`**: Server-side prefix scoping, no full scan
+- **`look --page-size` / `--page-sleep`**: Scan rate control, reduces follower burst pressure
+- **`core/meta.go`**: `KeyMeta` record + JSONL read/write
+- **`core/filter.go`**: Shared size filter, reused by look/summary
+- **`core/summary.go`**: Prefix aggregation engine `GroupStats` / `Summarize` / `GroupPrefix`
+
+### Changed
+
+- **`look` size field split**: Log/JSONL output changed from a single `size` field whose meaning varied with `--filter`, to fixed-semantics `key_size_bytes` / `value_size_bytes` / `kv_size_bytes` / `kv_size_human`
+- **`find --limit` pushed to server**: `WithLimit` pushed directly to etcd Range, safe even for large prefixes
+- **`data_source.go`**: Supports `WithKeysOnly()` / `WithPrefix()` / page-size / page-sleep
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `cmd/summary_cmd.go` | New summary command |
+| `cmd/look_cmd.go` | keys-only / jsonl / prefix / page-size / page-sleep / filter refactoring |
+| `cmd/distribute_cmd.go` | --prefix support |
+| `cmd/find_cmd.go` | --limit pushed to server |
+| `cmd/root_cmd.go` | Register summary |
+| `core/meta.go` | KeyMeta + JSONL read/write |
+| `core/filter.go` | Shared FilterConfig |
+| `core/summary.go` | Prefix aggregation engine |
+| `core/data_source.go` | keys-only / prefix / page control |
+| `core/report.go` | Adapted to new helpers |
 
 ---
 
-### CR-Fix 1: `histogramJSON()` incorrect bucket results (Critical)
+## [0.2.0] — 2026-06-18 — Phase 2: JSON Output Feature
 
-**Problem**
+> Commit `336b210` (feat) — distribute command adds `--write-out=json` support, outputting machine-readable JSON reports for scripting and automation.
+>
+> Commits `e0dde72`~`a18fbf6` (fix/test) — Based on Code Review feedback from the above two commits, fixes were applied incorporating multiple review opinions, and a complete test suite was established.
 
-`JSON()` called `histogramJSON()` before `percentilesJSON()`. The two-pointer bucket algorithm in `histogramJSON()` requires `r.stats.sizes` to be sorted (pointer `bi` only moves forward), but `sizes` was not yet sorted at that point. Text mode `String()` correctly calls `sort.Ints` before `histogram()`, but the JSON mode had the order wrong.
+### Added
 
-**Fix**
+- **`distribute --write-out=json`**: Machine-readable JSON output (summary/histogram/percentiles)
 
-Add `sort.Ints(r.stats.sizes)` at the beginning of `JSON()`, and remove the redundant sort inside `percentilesJSON()`.
+### Fixed
 
-**Files modified:** `core/report.go`
+- **CR-Fix 1**: `histogramJSON()` incorrect bucket results — unsorted `sizes` caused two-pointer algorithm failure (Critical)
+- **CR-Fix 2**: JSON mode empty data exposes `math.MaxInt32` / `-1` sentinel values
+- **CR-Fix 3**: `NewReport(bc, of, true)` variadic bool → Functional Options (`WithJSONMode()`)
+- **CR-Fix 4**: Pointless `100ms` sleep in `processResults` under JSON mode
+- **CR-Fix 5**: Duplicated data pipeline code across text/json branches → extracted common logic
+- **CR-Fix 6**: Stale v3.5.0 hashes in `go.sum` → `go mod tidy` cleaned 219 lines
+- **CR-Fix 7**: `ReportJSON.Percentiles` values had ambiguous units → added `_bytes` suffix to key names
+- **CR-Fix 8**: `percentilesJSON()` missing `countLock.RLock()` protection (inconsistent with `String()`)
+- **CR-Fix 9**: `sort.Ints` in `String()` races with `processResult`'s `append` — data race (Critical)
+- **CR-Fix 10**: `processResult` writes `Count`/`Smallest`/`Largest`/`Total`/`Average` without holding lock (Critical)
 
----
+### Files Modified
 
-### CR-Fix 2: Empty data exposes sentinel values in JSON mode
+| File | Changes |
+|------|---------|
+| `cmd/distribute_cmd.go` | Added JSON output; uses `WithJSONMode()`; extracted text/json common logic |
+| `core/report.go` | Histogram bucket sort; empty data guard; Functional Options; conditional sleep; explicit units; countLock consistency; data race fixes |
+| `go.sum` | `go mod tidy` cleanup |
 
-**Problem**
-
-When `Count == 0`, `Smallest` retains the initial sentinel value `math.MaxInt32` and `Largest` stays `-1`. Text mode has an empty data guard (outputs `"empty data"` and skips `finalString()`), but JSON mode would output meaningless sentinel values.
-
-**Fix**
-
-Add an empty data check at the start of `JSON()`, returning a reasonable zero-value structure:
-
-```go
-if r.stats.Count <= 0 {
-    empty := ReportJSON{
-        Summary:     SummaryJSON{},
-        Histogram:   []BucketJSON{},
-        Percentiles: map[string]int{},
-    }
-    data, _ := json.MarshalIndent(empty, "", "  ")
-    return string(data)
-}
-```
-
-**Files modified:** `core/report.go`
+> See [tests/README.md](tests/README.md) for the test suite documentation.
 
 ---
 
-### CR-Fix 3: `NewReport` variadic bool → Functional Options
+## [0.1.0] — 2026-06-16 — Phase 1: Initial Fixes
 
-**Problem**
+> Commit `8751b88` — Fix `WithPrefix` panic, flag collision, disable high-risk commands.
 
-`NewReport(bc, of, true)` — the meaning of `true` is opaque to the caller; unclear API design.
+### Fixed
 
-**Fix**
+- **Fix 1**: etcd client v3.5.0 `WithPrefix` reflection false-positive panic — upgraded etcd client v3.5.0 → v3.5.27
+- **Fix 2**: `--key` flag collision causing TLS connection failure — `find --key` → `--match-key`, `unmarshal --key` → `--target-key`
+- **Fix 3**: Disabled `clear` (Critical: deletes all data, irreversible) and `rename` (High: non-atomic Get→Put→Delete) high-risk commands
 
-Introduce the Functional Options pattern:
+### Files Modified
 
-```go
-type ReportOption func(*report)
-
-func WithJSONMode() ReportOption { ... }
-
-func NewReport(bc int, of SizeOf, opts ...ReportOption) Report { ... }
-```
-
-Caller code becomes:
-
-```go
-// JSON mode
-r := core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
-
-// Text mode (default)
-r := core.NewReport(bucketCount, sizeOf)
-```
-
-**Files modified:** `core/report.go`, `cmd/distribute_cmd.go`
-
----
-
-### CR-Fix 4: Pointless `processResults` sleep in JSON mode
-
-**Problem**
-
-`processResults()` had a fixed `time.Sleep(100ms)` at the end to allow text mode's dynamic output to flush. JSON mode has no dynamic output, making this sleep a waste of time.
-
-**Fix**
-
-Make it conditional:
-
-```go
-if !r.jsonMode {
-    time.Sleep(time.Millisecond * 100)
-}
-```
-
-**Files modified:** `core/report.go`
-
----
-
-### CR-Fix 5: Text/JSON code duplication in `distribute_cmd.go`
-
-**Problem**
-
-The text and JSON branches duplicated the entire data pipeline logic, differing only in `DynamicOutput()` and the final output format.
-
-**Fix**
-
-Extract the common data pipeline, branching only for Report construction and final output:
-
-```go
-isJSON := distributeWriteOut == "json"
-var r core.Report
-if isJSON {
-    r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
-} else {
-    r = core.NewReport(bucketCount, sizeOf)
-}
-// Common data pipeline
-c1 := r.Results()
-go func() {
-    defer close(c1)
-    if !isJSON && len(datac) > 0 {
-        r.DynamicOutput()
-    }
-    for data := range datac { c1 <- data }
-}()
-<-r.Run()
-if isJSON {
-    fmt.Println(r.JSON())
-}
-```
-
-**Files modified:** `cmd/distribute_cmd.go`
-
----
-
-### CR-Fix 6: Stale old-version hashes in `go.sum`
-
-**Problem**
-
-After upgrading etcd client, `go.sum` retained both v3.5.0 and v3.5.27 hashes.
-
-**Fix**
-
-Run `go mod tidy`, removing 219 lines of stale hashes.
-
-**Files modified:** `go.sum`
-
----
-
-### CR-Fix 7: Ambiguous unit in `ReportJSON.Percentiles` values
-
-**Problem**
-
-Percentile values were output as bare numbers `"p50": 424` with no indication of unit. Text mode shows `424.0 Byte` which is readable, but JSON mode lacked unit context.
-
-**Fix**
-
-Change the JSON tag from `percentiles` to `percentiles_bytes` and key names from `p50` to `p50_bytes`, making the byte unit explicit:
-
-```json
-// Before
-"percentiles": { "p50": 424 }
-
-// After
-"percentiles_bytes": { "p50_bytes": 424 }
-```
-
-**Files modified:** `core/report.go`
-
----
-
-### CR-Fix 8: `countLock` protection inconsistency
-
-**Problem**
-
-`String()` used `countLock.RLock()/RUnlock()` when calling `PrintPercent()`, but `percentilesJSON()` called `percentiles()` without any lock. While `JSON()` is called after `Run()` completes (safe in practice), the inconsistency with `String()`'s locking pattern creates a maintenance trap.
-
-**Fix**
-
-Add `countLock.RLock()/RUnlock()` in `percentilesJSON()`, consistent with `String()`.
-
-**Files modified:** `core/report.go`
-
----
-
-### CR-Fix 9: Data race in `String()` `sort.Ints`
-
-**Problem**
-
-`DynamicOutput()` calls `dynamicString()` → `String()` → `sort.Ints(r.stats.sizes)` every 100ms, while `processResult()` concurrently appends to `sizes`. `sort.Ints` mutates the slice in place without holding the lock, causing a data race with `append`. When `append` triggers slice growth, `sort` may read an inconsistent slice header, potentially causing a panic.
-
-**Fix**
-
-Wrap `sort.Ints` + `histogram()` + `PrintPercent()` in `String()` with a single `countLock.Lock()`/`Unlock()`, and remove the redundant per-element locks inside `histogram()`:
-
-```go
-r.stats.countLock.Lock()
-sort.Ints(r.stats.sizes)
-buffer.WriteString(r.histogram())
-buffer.WriteString(PrintPercent(...))
-r.stats.countLock.Unlock()
-```
-
-**Files modified:** `core/report.go`
-
----
-
-### CR-Fix 10: Field-level data race in `processResult`
-
-**Problem**
-
-`go test -race` detected that `processResult()` writes to `r.stats.Count`/`Smallest`/`Largest`/`Total`/`Average` without holding a lock, while `dynamicString()` and `finalString()` read these fields concurrently.
-
-**Fix**
-
-1. `processResult()`: Wrap all stat field writes in `countLock.Lock()/Unlock()`
-2. `dynamicString()` / `finalString()`: Protect `Count` reads with `countLock.RLock()`
-
-**Files modified:** `core/report.go`
+| File | Changes |
+|------|---------|
+| `go.mod` | etcd client v3.5.0 → v3.5.27, go 1.18 → 1.24 |
+| `go.sum` | Dependency hash updates |
+| `cmd/root_cmd.go` | Disabled clear and rename commands |
+| `cmd/find_cmd.go` | `--key` → `--match-key` |
+| `cmd/unmarsha_cmd.go` | `--key` → `--target-key` |
 
 ---
 
 ## Fix Status Summary
 
-| # | Issue | Severity | Status |
-|---|-------|----------|--------|
-| 1 | `WithPrefix` reflection false-positive panic | 🔴 Critical | ✅ Fix 1 |
-| 2 | `--key` flag collision causing TLS failure | 🔴 Critical | ✅ Fix 2 |
-| 3 | clear/rename high-risk commands | 🔴 Critical | ✅ Fix 3 |
-| 4 | `histogramJSON()` unsorted bucket error | 🔴 Critical | ✅ CR-Fix 1 |
-| 5 | JSON empty data exposes sentinel values | 🟡 Medium | ✅ CR-Fix 2 |
-| 6 | `NewReport` variadic bool API unclear | 🟡 Medium | ✅ CR-Fix 3 |
-| 7 | Pointless sleep in JSON mode | 🟡 Medium | ✅ CR-Fix 4 |
-| 8 | Text/JSON duplicated code | 🟡 Medium | ✅ CR-Fix 5 |
-| 9 | Stale hashes in `go.sum` | 🟢 Low | ✅ CR-Fix 6 |
-| 10 | Ambiguous percentile units | 🟢 Low | ✅ CR-Fix 7 |
-| 11 | `countLock` protection inconsistency | 🟡 Medium | ✅ CR-Fix 8 |
-| 12 | `String()` `sort.Ints` data race | 🔴 Critical | ✅ CR-Fix 9 |
-| 13 | `processResult` field-level data race | 🔴 Critical | ✅ CR-Fix 10 |
-| 14 | `go 1.18 -> 1.24` large version jump | 🟡 Medium | ⏭️ Skipped (needs CI env confirmation) |
-| 15 | Commented-out commands are hardcoded | 🟡 Medium | ⏭️ Skipped (process suggestion, not a code bug) |
-
----
-
-## Files Modified Summary
-
-| File | Changes |
-|------|--------|
-| `go.mod` | etcd client v3.5.0 -> v3.5.27, go 1.18 -> 1.24 |
-| `go.sum` | Dependency hash updates; `go mod tidy` cleanup of 219 stale lines |
-| `cmd/root_cmd.go` | Disabled clear and rename commands |
-| `cmd/find_cmd.go` | `--key` -> `--match-key` |
-| `cmd/unmarsha_cmd.go` | `--key` -> `--target-key` |
-| `cmd/distribute_cmd.go` | Added JSON output; uses `WithJSONMode()`; extracted common text/json logic |
-| `core/report.go` | Histogram sort fix; empty data guard; Functional Options; conditional sleep; explicit units; countLock consistency; data race fixes |
-
----
-
-> See [tests/README.md](tests/README.md) for the test suite documentation.
+| # | Issue | Severity | Phase | Status |
+|---|-------|----------|-------|--------|
+| 1 | `WithPrefix` reflection false-positive panic | Critical | 1 | ✅ Fix 1 |
+| 2 | `--key` flag collision causing TLS failure | Critical | 1 | ✅ Fix 2 |
+| 3 | clear/rename high-risk commands | Critical | 1 | ✅ Fix 3 |
+| 4 | `histogramJSON()` unsorted bucket error | Critical | 2 | ✅ CR-Fix 1 |
+| 5 | JSON empty data exposes sentinel values | Medium | 2 | ✅ CR-Fix 2 |
+| 6 | `NewReport` variadic bool API unclear | Medium | 2 | ✅ CR-Fix 3 |
+| 7 | Pointless sleep in JSON mode | Medium | 2 | ✅ CR-Fix 4 |
+| 8 | Text/JSON duplicated code | Medium | 2 | ✅ CR-Fix 5 |
+| 9 | Stale hashes in `go.sum` | Low | 2 | ✅ CR-Fix 6 |
+| 10 | Ambiguous percentile units | Low | 2 | ✅ CR-Fix 7 |
+| 11 | `countLock` protection inconsistency | Medium | 2 | ✅ CR-Fix 8 |
+| 12 | `String()` `sort.Ints` data race | Critical | 2 | ✅ CR-Fix 9 |
+| 13 | `processResult` field-level data race | Critical | 2 | ✅ CR-Fix 10 |
+| 14 | `go 1.18 -> 1.24` large version jump | Medium | — | ⏭️ Skipped (needs CI env confirmation) |
+| 15 | Commented-out commands are hardcoded | Medium | — | ⏭️ Skipped (process suggestion, not a code bug) |

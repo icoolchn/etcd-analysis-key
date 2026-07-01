@@ -145,13 +145,72 @@ func TestSummarize_KeysOnlyHasNoSize(t *testing.T) {
 }
 
 func TestValidSortKey(t *testing.T) {
-	for _, k := range []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count"} {
+	for _, k := range []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "rev-count", "tombstone-count"} {
 		if !core.ValidSortKey(k) {
 			t.Errorf("%q should be valid", k)
 		}
 	}
 	if core.ValidSortKey("nope") {
 		t.Error("\"nope\" should be invalid")
+	}
+}
+
+func metaWithRevCount(key string, create, mod, version int64, kvSize, revCount, tombstoneCount int) core.KeyMeta {
+	m := meta(key, create, mod, version, kvSize)
+	m.RevCount = &revCount
+	m.TombstoneCount = &tombstoneCount
+	return m
+}
+
+func TestSummarize_SortByRevCount(t *testing.T) {
+	metas := []core.KeyMeta{
+		metaWithRevCount("/a/x", 1, 1, 1, 10, 5, 1),
+		metaWithRevCount("/a/y", 1, 1, 1, 10, 10, 2),
+		metaWithRevCount("/b/x", 1, 1, 1, 10, 100, 0),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "rev-count"})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	if groups[0].Group != "/b" {
+		t.Errorf("sort by rev-count: first = %q, want /b (100)", groups[0].Group)
+	}
+	if groups[0].RevCount != 100 {
+		t.Errorf("/b RevCount = %d, want 100", groups[0].RevCount)
+	}
+	if groups[1].RevCount != 15 {
+		t.Errorf("/a RevCount = %d, want 15", groups[1].RevCount)
+	}
+}
+
+func TestSummarize_SortByTombstoneCount(t *testing.T) {
+	metas := []core.KeyMeta{
+		metaWithRevCount("/a/x", 1, 1, 1, 10, 5, 10),
+		metaWithRevCount("/b/x", 1, 1, 1, 10, 100, 1),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "tombstone-count"})
+	if groups[0].Group != "/a" {
+		t.Errorf("sort by tombstone-count: first = %q, want /a (10)", groups[0].Group)
+	}
+	if groups[0].TombstoneCount != 10 {
+		t.Errorf("/a TombstoneCount = %d, want 10", groups[0].TombstoneCount)
+	}
+}
+
+func TestSummarize_RevCountAggregation(t *testing.T) {
+	metas := []core.KeyMeta{
+		metaWithRevCount("/g/a", 1, 1, 1, 10, 3, 1),
+		metaWithRevCount("/g/b", 1, 1, 1, 10, 7, 2),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "count"})
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	if groups[0].RevCount != 10 {
+		t.Errorf("RevCount = %d, want 10 (3+7)", groups[0].RevCount)
+	}
+	if groups[0].TombstoneCount != 3 {
+		t.Errorf("TombstoneCount = %d, want 3 (1+2)", groups[0].TombstoneCount)
 	}
 }
 
