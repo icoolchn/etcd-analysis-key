@@ -3,8 +3,10 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/SimFG/etcd-analysis/core"
@@ -26,53 +28,45 @@ func NewDistributeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "distribute",
 		Short: "Show the data distribution of etcd",
-		Long: `
-Show the data distribution of etcd.
+		Long: `Show the global distribution of etcd data: Overview + Size Distribution +
+Version Distribution + Count Concentration + Diagnosis.
 
-According to setting <type>, this command will show the data distribution by the size of the <type>.
-The 'kv' means the 'key' and 'value'.
+Modes:
+  Online (default): scan etcd via --endpoints.
+      etcdctl+ distribute --type=kv
+  Offline: read a KeyMeta JSONL exported by 'look --write-out=jsonl'.
+      etcdctl+ distribute --input=keys.jsonl --type=kv
+  Offline snapshot db values (rev_count / tombstone_count) are reflected in
+  the Overview when present; online mode shows "online: unavailable" for those
+  two rows (the etcd Range API does not return historical revision counts).
 
-According to setting <bucket>, this command will show the different size histogram.
-Each size interval is '(maxSize - minSize) / bucket'.
+--type and size basis:
+  --type controls which size the size fields and the Size Distribution
+  histogram use. Overview size fields are labeled with the basis.
+    kv    (default) len(key)+len(value)   -> "Total kv size", "Kv size p50/p99"
+    key             len(key)              -> "Total key size", ...
+    value           len(value)            -> "Total value size", ...
+  When the basis is unavailable (e.g. --type=value on a keys-only JSONL),
+  the size fields show "-" and the Size Distribution section shows a notice;
+  Version / Count / Diagnosis are unaffected (they don't depend on value size).
 
-According to the output below, it means:
-when the data size is '0.0 B', the count of this kind of data is 12.
-when the data size is greater than '0.0B' and less than or equal to '573.0 B', the count is 275.
-'573.0 B' < size <= '1.1 KiB', count 80.
+--bucket controls the Size Distribution histogram bucket count (default 5).
 
-Example:
-$ distribute --type=value --bucket=8
-Summary:
-  Count:        399.
-  Total:        267.9 KiB.
-  Smallest:     0.0 B.
-  Largest:      4.5 KiB.
-  Average:      687.0 B.
+Diagnosis rules (4 dims; mod_revision_age is not used — version distribution
+covers write hotspots):
 
-Size histogram:
-  0.0 B [12]    |∎
-  573.0 B [275] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  1.1 KiB [80]   |∎∎∎∎∎∎∎∎∎∎
-  1.7 KiB [0]    |
-  2.2 KiB [0]    |
-  2.8 KiB [0]    |
-  3.4 KiB [0]    |
-  3.9 KiB [0]    |
-  4.5 KiB [32]   |∎∎∎∎
+  dim     normal                warning                       follow-up
+  count   top-1 < 80%           top-1 >= 80%  CONCENTRATED    summary --sort=count
+  size    p99 < 100KiB          p99 >= 100KiB LARGE VALUES    summary --sort=total-size
+  version max < 1K              exists > 1K   WRITE HOTSPOT   summary --sort=max-version
+  lease   lease=0 < 20%         lease=0 >= 20% HIGH PERSISTENT look --filter="lease=0"
 
-Size distribution:
-  10% in 3.0 B.
-  25% in 4.0 B.
-  50% in 424.0 B.
-  75% in 854.0 B.
-  90% in 1.0 KiB.
-  95% in 4.5 KiB.
-  99% in 4.5 KiB.
+Output format: --write-out=text (default) / json.
 `,
 		Run: distributeFunc,
 	}
 
-	cmd.Flags().StringVar(&distributeType, "type", "key", "Distribution basis; key, value or kv")
+	cmd.Flags().StringVar(&distributeType, "type", "kv", "Distribution basis; key, value or kv (default kv)")
 	cmd.Flags().IntVar(&bucketCount, "bucket", 5, "Bucket Count")
 	cmd.Flags().StringVar(&distributeWriteOut, "write-out", "text", "Output format: text or json")
 	cmd.Flags().StringVar(&distributeInput, "input", "", "KeyMeta JSONL file (offline mode); empty means online scan")
@@ -125,7 +119,9 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 	if isJSON {
 		r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
 	} else {
-		r = core.NewReport(bucketCount, sizeOf)
+		// Silent: don't print the size report to stdout during Run; we embed it
+		// in the template-ordered layout (Overview first) via String() instead.
+		r = core.NewReport(bucketCount, sizeOf, core.WithSilent())
 	}
 
 	// Collect metas alongside the size report so GlobalStats (Overview /
@@ -138,9 +134,10 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 	c1 := r.Results()
 	go func() {
 		defer close(c1)
-		if !isJSON && len(datac) > 0 {
-			r.DynamicOutput()
-		}
+		// No DynamicOutput here: the silent Report does not print its own
+		// finalString, and a live refresh would race with the template-ordered
+		// layout (Overview first) we print after Run. The size report is
+		// emitted once via r.String() inside printDistributeText.
 		for data := range datac {
 			c1 <- data
 			// snapshot metas for GlobalStats (online distribute fetches values,
@@ -156,12 +153,10 @@ func distributeFunc(cmd *cobra.Command, args []string) {
 	}()
 	<-r.Run()
 
-	// online current revision from the cached endpoint-status response.
-	var curRev int64
-	if st := core.LastStatus(); st != nil && st.Header != nil {
-		curRev = st.Header.Revision
-	}
-	g := core.ComputeGlobalStats(metas, curRev)
+	// --type drives both the size histogram (sizeOf above) and the Overview size
+	// fields, so they share one basis. Online distribute always fetches values,
+	// so value/kv are available; --type=key is also fine.
+	g := core.ComputeGlobalStats(metas, distributeType)
 
 	if isJSON {
 		fmt.Println(distributeJSON(r, g))
@@ -180,7 +175,11 @@ func distributeFromJSONL(isJSON bool) {
 	metaSizeOf := func(m core.KeyMeta) int {
 		switch distributeType {
 		case "value":
-			return int(m.ValueSize())
+			s := m.ValueSize()
+			if s < 0 {
+				return 0
+			}
+			return int(s)
 		case "kv":
 			s := m.KvSize()
 			if s < 0 {
@@ -199,7 +198,7 @@ func distributeFromJSONL(isJSON bool) {
 	if isJSON {
 		r = core.NewReport(bucketCount, sizeOf, core.WithJSONMode())
 	} else {
-		r = core.NewReport(bucketCount, sizeOf)
+		r = core.NewReport(bucketCount, sizeOf, core.WithSilent())
 	}
 
 	c1 := r.Results()
@@ -224,8 +223,9 @@ func distributeFromJSONL(isJSON bool) {
 	}()
 	<-r.Run()
 
-	// offline: no endpoint status; current_revision falls back to max(mod_revision).
-	g := core.ComputeGlobalStats(metas, 0)
+	// offline: basis from --type. If the JSONL is keys-only (no value_size),
+	// --type=value/kv yields HasSize=false and size fields render as "-".
+	g := core.ComputeGlobalStats(metas, distributeType)
 
 	if isJSON {
 		fmt.Println(distributeJSON(r, g))
@@ -234,54 +234,63 @@ func distributeFromJSONL(isJSON bool) {
 	printDistributeText(r, g)
 }
 
-// printDistributeText renders the full distribute output per template 3.1.2.
-// The existing size-distribution Report already printed itself to stdout during
-// Run() (via its uilive writer + finalString); we append the remaining sections
-// in order. Template 3.1.2 puts Overview first, but reordering would require
-// buffering the size report, so we keep Report's native streaming output and
-// follow it with Overview + Version + Count + Diagnosis.
+// printDistributeText renders the full distribute output per template 3.1.2:
+// Overview -> Size Distribution -> Version Distribution -> Count Concentration
+// -> Diagnosis. The size report is retrieved via String() (Report ran silent)
+// so we can place it after Overview instead of letting it stream first.
 //
-// Compact-revision / revision-gap / compact-count are omitted (v3.5.x
-// StatusResponse has no CompactRevision); mod_revision_age is skipped.
+// mod_revision_age is skipped (version distribution covers write hotspots).
 func printDistributeText(r core.Report, g core.GlobalStats) {
-	// (size distribution already printed by Report during Run())
+	fmt.Println("=== Overview ===")
+	fmt.Printf("  Total keys:                    %s\n", core.FormatThousands(int64(g.TotalKeys)))
+	printSizeGroup("key", g.KeySize, int64(g.TotalKeys))
+	printSizeGroup("value", g.ValueSize, int64(g.TotalKeys))
+	printSizeGroup("kv", g.KvSize, int64(g.TotalKeys))
+	fmt.Println("  --- activity ---")
+	fmt.Printf("  Lease=0 (persistent):          %.1f%%\n", g.LeaseZeroPct)
+	fmt.Printf("  create_revision min / max:     %s / %s\n",
+		core.FormatThousands(g.CreateRevMin), core.FormatThousands(g.CreateRevMax))
+	fmt.Printf("  mod_revision min / max:         %s / %s\n",
+		core.FormatThousands(g.ModRevMin), core.FormatThousands(g.ModRevMax))
+	fmt.Printf("  max version:                   %s\n", core.FormatThousands(g.MaxVersion))
+	if g.HasRevCount {
+		fmt.Printf("  history_revisions (total):     %s\n", core.FormatThousands(g.HistoryRevisionsTotal))
+		fmt.Printf("  tombstone_count (total):       %s\n", core.FormatThousands(g.TombstoneCountTotal))
+	} else {
+		fmt.Printf("  history_revisions (total):     online: unavailable\n")
+		fmt.Printf("  tombstone_count (total):       online: unavailable\n")
+	}
 
 	fmt.Println()
-	fmt.Println("=== Overview ===")
-	fmt.Printf("  Total keys:           %s\n", core.FormatThousands(int64(g.TotalKeys)))
-	if g.HasSize {
-		fmt.Printf("  Total size:           %s\n", core.ReadableSize(int(g.TotalSize)))
-		fmt.Printf("  Avg size:             %s\n", core.ReadableSize(int(g.AvgSize)))
-		fmt.Printf("  Size p50 / p99:       %s / %s\n", core.ReadableSize(g.SizeP50), core.ReadableSize(g.SizeP99))
+	fmt.Printf("=== Size Distribution (%s) ===\n", g.SizeBasis)
+	if sizeAvailable(g, g.SizeBasis) {
+		fmt.Print(r.String())
+	} else {
+		fmt.Printf("  (unavailable: --type=%s requires value size, but the data is keys-only)\n", g.SizeBasis)
 	}
-	fmt.Printf("  Lease=0 (persistent): %.1f%%\n", g.LeaseZeroPct)
-	if g.CurrentRevision > 0 {
-		fmt.Printf("  Current revision:     %s  (source: %s)\n",
-			core.FormatThousands(g.CurrentRevision), g.CurrentRevisionSource)
-	}
-	fmt.Printf("  create_revision min / max:  %s / %s\n",
-		core.FormatThousands(g.CreateRevMin), core.FormatThousands(g.CreateRevMax))
-	fmt.Printf("  mod_revision min / max:     %s / %s\n",
-		core.FormatThousands(g.ModRevMin), core.FormatThousands(g.ModRevMax))
 
 	fmt.Println()
 	fmt.Println("=== Version Distribution ===")
-	fmt.Println("Version histogram (log buckets):")
+	fmt.Println("  Version histogram:")
 	maxVC := 0
 	for _, b := range g.VersionBuckets {
 		if b.Count > maxVC {
 			maxVC = b.Count
 		}
 	}
+	vtw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, b := range g.VersionBuckets {
 		barLen := 0
 		if maxVC > 0 {
 			barLen = b.Count * 40 / maxVC
 		}
-		fmt.Printf("  %-8s [%s] |%s\n", b.Label, core.FormatThousands(int64(b.Count)), strings.Repeat("∎", barLen))
+		fmt.Fprintf(vtw, "    %s\t[%s]\t|%s\n", b.Label, core.FormatThousands(int64(b.Count)), strings.Repeat("∎", barLen))
 	}
-
+	vtw.Flush()
+	fmt.Println("  Version distribution:")
+	printVersionPercentiles(g.VersionPctls)
 	fmt.Println()
+
 	fmt.Println("=== Count Concentration (top-5 depth-2 prefixes) ===")
 	for _, p := range g.TopPrefixes {
 		fmt.Printf("  %-50s %s  (%.1f%%)\n", p.Prefix, core.FormatThousands(int64(p.Count)), p.Pct)
@@ -293,7 +302,55 @@ func printDistributeText(r core.Report, g core.GlobalStats) {
 	fmt.Printf("  size:      %s  (%s)\n", verdictMark(g.Diagnosis.Size), g.Diagnosis.SizeDetail)
 	fmt.Printf("  version:   %s  (%s)\n", verdictMark(g.Diagnosis.Version), g.Diagnosis.VersionDetail)
 	fmt.Printf("  lease:     %s  (%s)\n", verdictMark(g.Diagnosis.Lease), g.Diagnosis.LeaseDetail)
-	fmt.Println("  (mod_revision_age: skipped — needs reliable current_revision baseline)")
+}
+
+// sizeAvailable reports whether the given basis has data (keys-only data has
+// no value/kv, so those bases render the Size Distribution as unavailable).
+func sizeAvailable(g core.GlobalStats, basis string) bool {
+	switch basis {
+	case "value":
+		return g.ValueSize.Available
+	case "key":
+		return g.KeySize.Available
+	case "kv":
+		fallthrough
+	default:
+		return g.KvSize.Available
+	}
+}
+
+// printSizeGroup prints one basis block of the Overview size section.
+// When the basis is unavailable (keys-only data + value/kv), every field
+// shows "-" instead of numbers.
+func printSizeGroup(name string, s core.SizeStats, totalKeys int64) {
+	fmt.Printf("  --- size (%s) ---\n", name)
+	if !s.Available {
+		fmt.Printf("  Total %s size:                -\n", name)
+		fmt.Printf("  Avg %s size:                  -\n", name)
+		fmt.Printf("  %s size min / max:            -\n", name)
+		fmt.Printf("  %s size p50 / p99:            -\n", name)
+		return
+	}
+	avg := int64(0)
+	if totalKeys > 0 {
+		avg = s.Total / totalKeys
+	}
+	fmt.Printf("  Total %s size:                %s\n", name, core.ReadableSize(int(s.Total)))
+	fmt.Printf("  Avg %s size:                  %s\n", name, core.ReadableSize(int(avg)))
+	fmt.Printf("  %s size min / max:            %s / %s\n", name, core.ReadableSize(int(s.Min)), core.ReadableSize(int(s.Max)))
+	fmt.Printf("  %s size p50 / p99:            %s / %s\n", name, core.ReadableSize(s.P50), core.ReadableSize(s.P99))
+}
+
+// printVersionPercentiles renders the version distribution percentile table,
+// mirroring the size "X% in Y." format. pctls is [p10,p25,p50,p75,p90,p95,p99].
+func printVersionPercentiles(pctls []int) {
+	labels := []int{10, 25, 50, 75, 90, 95, 99}
+	for i, p := range labels {
+		if i >= len(pctls) {
+			break
+		}
+		fmt.Printf("    %d%% in %s.\n", p, core.FormatThousands(int64(pctls[i])))
+	}
 }
 
 // verdictMark returns a one-glyph status marker for a diagnosis verdict.
@@ -312,19 +369,30 @@ func verdictMark(v string) string {
 // (renamed to template 2.4.3 alignment) plus Overview / version dist / count
 // concentration / diagnosis.
 func distributeJSON(r core.Report, g core.GlobalStats) string {
+	type sizeStatsJSON struct {
+		Available bool  `json:"available"`
+		Total     int64 `json:"total_bytes"`
+		Min       int64 `json:"min_bytes"`
+		Max       int64 `json:"max_bytes"`
+		P50       int   `json:"p50_bytes"`
+		P99       int   `json:"p99_bytes"`
+	}
 	type overviewJSON struct {
-		TotalKeys             int64   `json:"total_keys"`
-		TotalSizeBytes        int64   `json:"total_size_bytes,omitempty"`
-		AvgSizeBytes          int64   `json:"avg_size_bytes,omitempty"`
-		SizeP50               int     `json:"size_p50_bytes,omitempty"`
-		SizeP99               int     `json:"size_p99_bytes,omitempty"`
-		LeaseZeroPct          float64 `json:"lease_zero_pct,omitempty"`
-		CurrentRevision       int64   `json:"current_revision,omitempty"`
-		CurrentRevisionSource string  `json:"current_revision_source,omitempty"`
-		CreateRevMin          int64   `json:"create_revision_min,omitempty"`
-		CreateRevMax          int64   `json:"create_revision_max,omitempty"`
-		ModRevMin             int64   `json:"mod_revision_min,omitempty"`
-		ModRevMax             int64   `json:"mod_revision_max,omitempty"`
+		TotalKeys           int64        `json:"total_keys"`
+		SizeBasis           string       `json:"size_basis"`
+		KeySize             sizeStatsJSON `json:"key_size"`
+		ValueSize           sizeStatsJSON `json:"value_size"`
+		KvSize              sizeStatsJSON `json:"kv_size"`
+		LeaseZeroPct        float64      `json:"lease_zero_pct"`
+		CreateRevMin        int64        `json:"create_revision_min"`
+		CreateRevMax        int64        `json:"create_revision_max"`
+		ModRevMin           int64        `json:"mod_revision_min"`
+		ModRevMax           int64        `json:"mod_revision_max"`
+		MaxVersion          int64        `json:"max_version"`
+		HasRevCount         bool         `json:"has_rev_count"`
+		HistoryRevisions    int64        `json:"history_revisions_total,omitempty"`
+		TombstoneCount      int64        `json:"tombstone_count_total,omitempty"`
+		VersionPctls        []int        `json:"version_percentiles,omitempty"`
 	}
 	type versionBucketJSON struct {
 		Label string `json:"label"`
@@ -342,16 +410,16 @@ func distributeJSON(r core.Report, g core.GlobalStats) string {
 		Lease   string `json:"lease"`
 	}
 	type out struct {
-		SizeReport   json.RawMessage   `json:"size_report"`
-		Overview     overviewJSON      `json:"overview"`
-		VersionDist  []versionBucketJSON `json:"version_distribution"`
-		CountConcentration []prefixJSON `json:"count_concentration"`
-		Diagnosis    diagnosisJSON     `json:"diagnosis"`
+		SizeReport         json.RawMessage     `json:"size_report"`
+		Overview           overviewJSON        `json:"overview"`
+		VersionDist        []versionBucketJSON `json:"version_distribution"`
+		CountConcentration []prefixJSON        `json:"count_concentration"`
+		Diagnosis          diagnosisJSON       `json:"diagnosis"`
 	}
 
-	// Parse the existing report JSON so we can nest it; field renaming to
-	// template 2.4.3 (total_size_bytes / min/max/avg_size_bytes) is a follow-up
-	// in core/report.go — here we embed as-is to avoid a double-encode.
+	toSizeJSON := func(s core.SizeStats) sizeStatsJSON {
+		return sizeStatsJSON{Available: s.Available, Total: s.Total, Min: s.Min, Max: s.Max, P50: s.P50, P99: s.P99}
+	}
 	vb := make([]versionBucketJSON, 0, len(g.VersionBuckets))
 	for _, b := range g.VersionBuckets {
 		vb = append(vb, versionBucketJSON{Label: b.Label, Count: b.Count})
@@ -364,21 +432,24 @@ func distributeJSON(r core.Report, g core.GlobalStats) string {
 	o := out{
 		SizeReport: json.RawMessage(r.JSON()),
 		Overview: overviewJSON{
-			TotalKeys:             int64(g.TotalKeys),
-			TotalSizeBytes:        g.TotalSize,
-			AvgSizeBytes:          g.AvgSize,
-			SizeP50:               g.SizeP50,
-			SizeP99:               g.SizeP99,
-			LeaseZeroPct:          g.LeaseZeroPct,
-			CurrentRevision:       g.CurrentRevision,
-			CurrentRevisionSource: g.CurrentRevisionSource,
-			CreateRevMin:          g.CreateRevMin,
-			CreateRevMax:          g.CreateRevMax,
-			ModRevMin:             g.ModRevMin,
-			ModRevMax:             g.ModRevMax,
+			TotalKeys:        int64(g.TotalKeys),
+			SizeBasis:        g.SizeBasis,
+			KeySize:          toSizeJSON(g.KeySize),
+			ValueSize:        toSizeJSON(g.ValueSize),
+			KvSize:           toSizeJSON(g.KvSize),
+			LeaseZeroPct:     g.LeaseZeroPct,
+			CreateRevMin:    g.CreateRevMin,
+			CreateRevMax:     g.CreateRevMax,
+			ModRevMin:       g.ModRevMin,
+			ModRevMax:       g.ModRevMax,
+			MaxVersion:      g.MaxVersion,
+			HasRevCount:     g.HasRevCount,
+			HistoryRevisions:    g.HistoryRevisionsTotal,
+			TombstoneCount:  g.TombstoneCountTotal,
+			VersionPctls:    g.VersionPctls,
 		},
-		VersionDist:         vb,
-		CountConcentration:  pc,
+		VersionDist:        vb,
+		CountConcentration: pc,
 		Diagnosis: diagnosisJSON{
 			Count:   g.Diagnosis.Count,
 			Size:    g.Diagnosis.Size,
