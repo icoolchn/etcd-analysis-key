@@ -6,50 +6,79 @@ import (
 )
 
 // GlobalStats aggregates cluster-wide metrics from per-key KeyMeta records,
-// plus optional cluster metadata (current revision, db size) from endpoint
-// status when online. It backs the `distribute` Overview + Diagnosis sections
-// per etcd-analysis-key-data-display-template.md 3.1.
+// backing the `distribute` Overview + Diagnosis sections per
+// etcd-analysis-key-data-display-template.md 3.1.
 //
-// Compact-revision / compact-count / revision-gap are intentionally absent:
-// v3.5.x StatusResponse does not carry CompactRevision (it only appears on
-// WatchResponse), so those three cannot be obtained via the clientv3 API.
-// The template's "cluster health" row is therefore trimmed to current_revision
-// only; compact metrics would require reading the snapshot db meta bucket or
-// Prometheus metrics, which is a separate data channel.
+// Size metrics (TotalSize / AvgSize / SizeP50 / SizeP99 / SizeMin / SizeMax)
+// are computed on the basis selected by --type (key / value / kv): the same
+// basis drives both the Overview size fields and the Size Distribution
+// histogram, so the two stay consistent. When the basis is unavailable
+// (e.g. --type=value or --type=kv on a keys-only JSONL where value_size is
+// absent), HasSize is false and size fields render as "-".
+//
+// Compact-revision / compact-count / revision-gap and current_revision are
+// intentionally absent: v3.5.x StatusResponse does not carry CompactRevision,
+// and the template (3.1.3) trimmed the Overview to scale + time-range only.
 type GlobalStats struct {
 	TotalKeys int
-	TotalSize int64
-	HasSize   bool // false when all records are keys-only (no value size)
+
+	// Size stats on all three bases, always populated independently so the
+	// Overview can show key / value / kv side by side regardless of --type.
+	// --type only selects which basis the Size Distribution histogram uses.
+	// Each is zero-valued (Available=false) when that basis is unavailable
+	// (e.g. value/kv on a keys-only JSONL where value_size is absent).
+	KeySize   SizeStats
+	ValueSize SizeStats
+	KvSize    SizeStats
+
+	// SizeBasis is which basis the Size Distribution histogram is on
+	// (driven by --type, default "kv"). The histogram itself is rendered by
+	// core.Report, not stored here.
+	SizeBasis string
 
 	LeaseZero    int
 	LeaseZeroPct float64
-
-	SizeP50  int
-	SizeP99  int
-	SizeMin  int64
-	SizeMax  int64
-	AvgSize  int64
 
 	CreateRevMin int64
 	CreateRevMax int64
 	ModRevMin   int64
 	ModRevMax   int64
 
-	// current revision baseline: online = endpoint status Header.Revision;
-	// offline = max(mod_revision) across records. 0 when no records.
-	CurrentRevision int64
-	CurrentRevisionSource string // "endpoint status" | "max(mod_revision)" | ""
+	// history_revisions / tombstone_count totals (offline snapshot JSONL only;
+	// online Range API does not return historical revision counts).
+	// history_revisions = per-key historical revision count (NOT reset on
+	// delete, unlike mvccpb.KeyValue.Version); tombstone_count = per-key
+	// tombstone count. HasRevCount is true when at least one record carried
+	// these fields. No distribution / no diagnosis threshold — just the global
+	// sum, shown in the Overview so the global view does not silently lose
+	// write-amplification signal offline.
+	HistoryRevisionsTotal int64
+	TombstoneCountTotal  int64
+	HasRevCount          bool
 
 	// version distribution: log buckets 1, 2~10, 11~100, 101~1K, 1K~10K, 10K+
 	VersionBuckets []VersionBucket
 	MaxVersion     int64
+	// VersionPctls = [p10,p25,p50,p75,p90,p95,p99] of version, for the
+	// "Version distribution" percentile table mirroring the size one.
+	VersionPctls []int
 
 	// count concentration: top-5 depth-2 prefix groups + others
 	TopPrefixes []PrefixCount
 	OthersCount int
 
-	// Diagnosis (4 dims; mod_revision_age skipped per plan)
+	// Diagnosis (4 dims; mod_revision_age skipped — version dist covers write hotspots)
 	Diagnosis Diagnosis
+}
+
+// SizeStats holds the aggregate size metrics on one basis (key/value/kv).
+type SizeStats struct {
+	Available bool // false when this basis is unavailable for all records
+	Total     int64
+	Min       int64
+	Max       int64
+	P50       int
+	P99       int
 }
 
 // VersionBucket is one log-scale bucket of the version histogram.
@@ -67,8 +96,6 @@ type PrefixCount struct {
 }
 
 // Diagnosis holds the one-line diagnostic verdicts per template 3.1.5.
-// mod_revision_age is intentionally omitted (needs a reliable current_revision
-// baseline and is noisy offline).
 type Diagnosis struct {
 	Count   string // "CONCENTRATED" | "SKEWED" | "BALANCED"
 	Size    string // "LARGE VALUES" | "OK"
@@ -82,46 +109,46 @@ type Diagnosis struct {
 	LeaseDetail   string
 }
 
-// ComputeGlobalStats aggregates metas into a GlobalStats. currentRevision is
-// the online endpoint-status revision (0 if offline); when 0, the offline
-// fallback max(mod_revision) is used and CurrentRevisionSource reflects that.
-func ComputeGlobalStats(metas []KeyMeta, currentRevision int64) GlobalStats {
-	g := GlobalStats{TotalKeys: len(metas)}
+// ComputeGlobalStats aggregates metas into a GlobalStats. sizeBasis only
+// selects which basis the Size Distribution histogram (rendered by core.Report)
+// is on; the Overview always shows all three bases (key/value/kv).
+func ComputeGlobalStats(metas []KeyMeta, sizeBasis string) GlobalStats {
+	if sizeBasis == "" {
+		sizeBasis = "kv"
+	}
+	g := GlobalStats{TotalKeys: len(metas), SizeBasis: sizeBasis}
 
 	if len(metas) == 0 {
 		return g
 	}
 
-	sizes := make([]int, 0, len(metas))
-	sizeToCount := make(map[int]int)
-	seenSize := make(map[int]bool)
+	// Three independent size accumulators, one per basis. Each tracks its own
+	// distinct-size list + count map for percentile computation.
+	keyAcc := newSizeAccum()
+	valAcc := newSizeAccum()
+	kvAcc := newSizeAccum()
+	versionAcc := newSizeAccum() // version as a size-like series for percentiles
 	versionBuckets := newVersionBuckets()
 	prefixCount := make(map[string]int)
 
-	g.SizeMin = -1
 	for _, m := range metas {
-		// size
-		if kv := m.KvSize(); kv >= 0 {
-			g.HasSize = true
-			g.TotalSize += kv
-			if g.SizeMin < 0 || kv < g.SizeMin {
-				g.SizeMin = kv
-			}
-			if kv > g.SizeMax {
-				g.SizeMax = kv
-			}
-			// dedup sizes: percentiles expects one entry per distinct size
-			// (matching Report.processResult), not one per record.
-			if !seenSize[int(kv)] {
-				seenSize[int(kv)] = true
-				sizes = append(sizes, int(kv))
-			}
-			sizeToCount[int(kv)]++
-		}
+		keyAcc.add(int64(m.KeySizeBytes))
+		valAcc.add(m.ValueSize())
+		kvAcc.add(m.KvSize())
+		versionAcc.add(m.Version)
 
 		// lease
 		if m.Lease == 0 {
 			g.LeaseZero++
+		}
+
+		// history_revisions / tombstone_count (offline snapshot only).
+		if m.RevCount != nil {
+			g.HasRevCount = true
+			g.HistoryRevisionsTotal += int64(*m.RevCount)
+		}
+		if m.TombstoneCount != nil {
+			g.TombstoneCountTotal += int64(*m.TombstoneCount)
 		}
 
 		// revisions
@@ -152,35 +179,88 @@ func ComputeGlobalStats(metas []KeyMeta, currentRevision int64) GlobalStats {
 		prefixCount[GroupPrefix(m.Key, 2)]++
 	}
 
-	if g.HasSize && g.TotalKeys > 0 {
-		g.AvgSize = g.TotalSize / int64(g.TotalKeys)
+	g.KeySize = keyAcc.finalize()
+	g.ValueSize = valAcc.finalize()
+	g.KvSize = kvAcc.finalize()
+	g.VersionPctls = versionAcc.finalizePctls()
+
+	if g.TotalKeys > 0 {
 		g.LeaseZeroPct = float64(g.LeaseZero) * 100.0 / float64(g.TotalKeys)
-		// percentiles expects sizes sorted ascending (it does not sort internally).
-		sort.Ints(sizes)
-		pctls := percentiles(sizes, sizeToCount)
-		// pctls order: 10,25,50,75,90,95,99
-		if len(pctls) >= 7 {
-			g.SizeP50 = pctls[2]
-			g.SizeP99 = pctls[6]
-		}
 	}
 
 	g.VersionBuckets = versionBuckets.buckets
-
-	// current revision baseline
-	if currentRevision > 0 {
-		g.CurrentRevision = currentRevision
-		g.CurrentRevisionSource = "endpoint status"
-	} else if g.ModRevMax > 0 {
-		g.CurrentRevision = g.ModRevMax
-		g.CurrentRevisionSource = "max(mod_revision)"
-	}
 
 	// count concentration: top-5 + others
 	g.TopPrefixes, g.OthersCount = topPrefixes(prefixCount, 5)
 
 	g.Diagnosis = computeDiagnosis(g)
 	return g
+}
+
+// sizeAccum collects per-basis size totals + distinct sizes for percentiles.
+type sizeAccum struct {
+	available   bool
+	total       int64
+	min         int64
+	max         int64
+	sizes       []int // distinct sizes, for percentiles
+	sizeToCount map[int]int
+	seen        map[int]bool
+}
+
+func newSizeAccum() *sizeAccum {
+	return &sizeAccum{
+		min:         -1,
+		sizeToCount: make(map[int]int),
+		seen:        make(map[int]bool),
+	}
+}
+
+// add accumulates one record's size on this basis. s < 0 means the basis is
+// unavailable for this record (e.g. value/kv on a keys-only record); skip.
+func (a *sizeAccum) add(s int64) {
+	if s < 0 {
+		return
+	}
+	a.available = true
+	a.total += s
+	if a.min < 0 || s < a.min {
+		a.min = s
+	}
+	if s > a.max {
+		a.max = s
+	}
+	// dedup: percentiles expects one entry per distinct size.
+	if !a.seen[int(s)] {
+		a.seen[int(s)] = true
+		a.sizes = append(a.sizes, int(s))
+	}
+	a.sizeToCount[int(s)]++
+}
+
+// finalize returns the SizeStats, computing p50/p99 via percentiles.
+func (a *sizeAccum) finalize() SizeStats {
+	if !a.available {
+		return SizeStats{}
+	}
+	sort.Ints(a.sizes)
+	pctls := percentiles(a.sizes, a.sizeToCount)
+	s := SizeStats{Available: true, Total: a.total, Min: a.min, Max: a.max}
+	if len(pctls) >= 7 {
+		s.P50 = pctls[2]
+		s.P99 = pctls[6]
+	}
+	return s
+}
+
+// finalizePctls returns the full percentile slice [p10,p25,p50,p75,p90,p95,p99],
+// used for the version distribution table.
+func (a *sizeAccum) finalizePctls() []int {
+	if !a.available {
+		return nil
+	}
+	sort.Ints(a.sizes)
+	return percentiles(a.sizes, a.sizeToCount)
 }
 
 // versionHist is a log-scale version histogram builder.
@@ -290,17 +370,18 @@ func computeDiagnosis(g GlobalStats) Diagnosis {
 		}
 	}
 
-	// size: p99 >= 100KiB -> LARGE VALUES.
-	if g.HasSize {
-		if g.SizeP99 >= 100*1024 {
+	// size: kv p99 >= 100KiB -> LARGE VALUES. Diagnosis always uses kv (not the
+	// --type basis) so the threshold doesn't drift with --type.
+	if g.KvSize.Available {
+		if g.KvSize.P99 >= 100*1024 {
 			d.Size = "LARGE VALUES"
 		} else {
 			d.Size = "OK"
 		}
-		d.SizeDetail = fmt.Sprintf("p99=%s, max=%s", ReadableSize(g.SizeP99), ReadableSize(int(g.SizeMax)))
+		d.SizeDetail = fmt.Sprintf("kv p99=%s, max=%s", ReadableSize(g.KvSize.P99), ReadableSize(int(g.KvSize.Max)))
 	} else {
 		d.Size = "OK"
-		d.SizeDetail = "keys-only, no size"
+		d.SizeDetail = "keys-only, no kv size"
 	}
 
 	// version: any version > 1K -> WRITE HOTSPOT.
