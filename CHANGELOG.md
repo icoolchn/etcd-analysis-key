@@ -15,6 +15,8 @@ This document follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - **`wal-summary` command**: Reads WalOp JSONL or parses WAL directly → aggregates Put/Delete counts per key → `--sort=put-count/delete-count` sorted Top N
 - **`dump` command set**: Subcommands `list-bucket` / `iterate-bucket` (+ size enhancement) / `scan-keys` / `wal`, raw plaintext export
 - **`summary --sort=rev-count/tombstone-count`**: New sort dimensions for offline snapshot JSONL, locating historical revision accumulation and frequent-deletion hotspots
+- **`summary --strip-suffix=<sep>`**: Strip the trailing `<sep><suffix>` from the LAST path segment before grouping, so Kubernetes `<name>.<uid>` keys (events / services / endpoints ...) aggregate by `<name>`. Only the final segment is affected; intermediate segments and `--group-depth` semantics are unchanged. Empty (default) = off
+- **`summary --sort=distinct-lease-count` + `key_leased_count` / `distinct_lease_count` / `max_lease` columns**: Three lease dimensions per prefix group: `key_leased_count` = how many keys have a non-zero lease (additive); `distinct_lease_count` = number of distinct lease ids (de-duplicated); `max_lease` = the largest lease id (a real, `etcdctl lease inspect`-able id). The ratio `key_leased_count / distinct_lease_count` is the lease-reuse factor (≈1 → each key has its own lease; >>1 → keys share few leases). `--sort=distinct-lease-count` ranks prefixes by lease diversity. Consistent with `distribute`'s `lease==0 = persistent` semantics
 - **`distribute --input` / `find --input`**: Consume KeyMeta JSONL for offline analysis, aligned with `summary --input`
 - **`core/snapshot_source.go`**: `SnapshotSource` single-pass all fields, adapted from `ahrtr/etcd-diagnosis`'s `BytesToBucketKey` (~60 lines)
 - **`core/wal_source.go`**: `WalSource` + `WalOp` struct + all 12 entry-types
@@ -24,6 +26,10 @@ This document follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 - **`KeyMeta`** adds `RevCount` / `TombstoneCount` fields, JSONL read/write adapted
 - **`look` help text**: `--keys-only` annotated "online only; ignored with --snapshot"; `--snapshot` notes "outputs all fields in a single pass"
+
+### Fixed
+
+- **`summary` header group count**: `Summary: X keys, Y groups` previously used the key count for `Y` (e.g. "6 groups" for 6 keys forming 2 groups). Now `Y` is the real group count (`top N + M others` when truncated)
 
 ### Design Decisions
 

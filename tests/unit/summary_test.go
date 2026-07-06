@@ -173,7 +173,7 @@ func TestSummarize_KeysOnlyHasNoSize(t *testing.T) {
 }
 
 func TestValidSortKey(t *testing.T) {
-	for _, k := range []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "rev-count", "tombstone-count"} {
+	for _, k := range []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "distinct-lease-count", "rev-count", "tombstone-count"} {
 		if !core.ValidSortKey(k) {
 			t.Errorf("%q should be valid", k)
 		}
@@ -187,6 +187,12 @@ func metaWithRevCount(key string, create, mod, version int64, kvSize, revCount, 
 	m := meta(key, create, mod, version, kvSize)
 	m.RevCount = &revCount
 	m.TombstoneCount = &tombstoneCount
+	return m
+}
+
+func metaWithLease(key string, create, mod, version int64, kvSize int, lease int64) core.KeyMeta {
+	m := meta(key, create, mod, version, kvSize)
+	m.Lease = lease
 	return m
 }
 
@@ -265,5 +271,110 @@ func TestSummarize_WithFilter(t *testing.T) {
 	}
 	if groups[1].Group != "/a" || groups[1].TotalSize != 1000 {
 		t.Errorf("second group wrong: %+v", groups[1])
+	}
+}
+
+func TestStripLastSegmentSuffix(t *testing.T) {
+	cases := []struct {
+		key, sep, want string
+	}{
+		{"/registry/events/kyuubi/foo.abc123", ".", "/registry/events/kyuubi/foo"},
+		{"/registry/events/kyuubi/foo.bar.abc123", ".", "/registry/events/kyuubi/foo.bar"}, // name with dot kept
+		{"/registry/events/kyuubi/foo", ".", "/registry/events/kyuubi/foo"},                 // no sep in last segment
+		{"/a/b.c/d", ".", "/a/b.c/d"},                                                       // sep not in last segment
+		{"/registry/events/kyuubi/foo.abc123", "", "/registry/events/kyuubi/foo.abc123"},   // empty sep = off
+		{"qaenv", ".", "qaenv"},           // no slash, no sep
+		{"qaenv.suffix", ".", "qaenv"},    // no slash, sep present
+		{"/trailing/", ".", "/trailing/"}, // empty last segment
+	}
+	for _, c := range cases {
+		got := core.StripLastSegmentSuffix(c.key, c.sep)
+		if got != c.want {
+			t.Errorf("StripLastSegmentSuffix(%q, %q) = %q, want %q", c.key, c.sep, got, c.want)
+		}
+	}
+}
+
+func TestSummarize_StripSuffix(t *testing.T) {
+	// Three events: two share the name "foo" (different uids), one is "bar".
+	// Without stripping, depth=4 would group each key by its full last
+	// segment "foo.abc" etc. (count=1 each). With --strip-suffix=., "foo"
+	// aggregates to count=2.
+	metas := []core.KeyMeta{
+		meta("/registry/events/kyuubi/foo.abc", 1, 1, 1, 10),
+		meta("/registry/events/kyuubi/foo.def", 1, 1, 1, 10),
+		meta("/registry/events/kyuubi/bar.ghi", 1, 1, 1, 10),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{
+		GroupDepth:  4,
+		StripSuffix: ".",
+		Top:         10,
+		SortBy:      "count",
+	})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	if groups[0].Group != "/registry/events/kyuubi/foo" || groups[0].Count != 2 {
+		t.Errorf("top group = %+v, want /registry/events/kyuubi/foo count 2", groups[0])
+	}
+}
+
+func TestSummarize_LeaseFields(t *testing.T) {
+	// /a: two keys share lease 100, one persistent (lease=0).
+	// /b: two keys with distinct leases 200, 300.
+	metas := []core.KeyMeta{
+		metaWithLease("/a/x", 1, 1, 1, 10, 100),
+		metaWithLease("/a/y", 1, 1, 1, 10, 100), // dup lease -> distinct stays 1
+		metaWithLease("/a/z", 1, 1, 1, 10, 0),  // persistent
+		metaWithLease("/b/x", 1, 1, 1, 10, 200),
+		metaWithLease("/b/y", 1, 1, 1, 10, 300),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "count"})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	g := map[string]core.GroupStats{}
+	for _, gr := range groups {
+		g[gr.Group] = gr
+	}
+	// /a: 3 keys, 2 leased, 1 distinct lease, max lease 100.
+	if g["/a"].KeyLeasedCount != 2 {
+		t.Errorf("/a KeyLeasedCount = %d, want 2", g["/a"].KeyLeasedCount)
+	}
+	if g["/a"].DistinctLeaseCount != 1 {
+		t.Errorf("/a DistinctLeaseCount = %d, want 1 (both leased keys share lease 100)", g["/a"].DistinctLeaseCount)
+	}
+	if g["/a"].MaxLease != 100 {
+		t.Errorf("/a MaxLease = %d, want 100", g["/a"].MaxLease)
+	}
+	// /b: 2 keys, 2 leased, 2 distinct leases, max lease 300.
+	if g["/b"].KeyLeasedCount != 2 {
+		t.Errorf("/b KeyLeasedCount = %d, want 2", g["/b"].KeyLeasedCount)
+	}
+	if g["/b"].DistinctLeaseCount != 2 {
+		t.Errorf("/b DistinctLeaseCount = %d, want 2 (200 and 300)", g["/b"].DistinctLeaseCount)
+	}
+	if g["/b"].MaxLease != 300 {
+		t.Errorf("/b MaxLease = %d, want 300", g["/b"].MaxLease)
+	}
+}
+
+func TestSummarize_SortByDistinctLeaseCount(t *testing.T) {
+	// /a has 1 distinct lease, /b has 2. sort desc -> /b first.
+	metas := []core.KeyMeta{
+		metaWithLease("/a/x", 1, 1, 1, 10, 100),
+		metaWithLease("/a/y", 1, 1, 1, 10, 100), // dup
+		metaWithLease("/b/x", 1, 1, 1, 10, 200),
+		metaWithLease("/b/y", 1, 1, 1, 10, 300),
+	}
+	groups := core.Summarize(metas, core.SummaryConfig{GroupDepth: 1, Top: 10, SortBy: "distinct-lease-count"})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	if groups[0].Group != "/b" || groups[0].DistinctLeaseCount != 2 {
+		t.Errorf("top group = %+v, want /b distinct_lease_count 2", groups[0])
+	}
+	if groups[1].Group != "/a" || groups[1].DistinctLeaseCount != 1 {
+		t.Errorf("second group = %+v, want /a distinct_lease_count 1", groups[1])
 	}
 }

@@ -15,6 +15,8 @@
 - **`wal-summary` 命令**：从 WalOp JSONL 或直接解析 WAL → 按 key 聚合 Put/Delete 次数 → `--sort=put-count/delete-count` 排序 Top N
 - **`dump` 命令集**：子命令 `list-bucket` / `iterate-bucket`（+ size 增强）/ `scan-keys` / `wal`，纯文本原始导出
 - **`summary --sort=rev-count/tombstone-count`**：离线 snapshot JSONL 新增排序维度，定位历史 revision 堆积和频繁删除热点
+- **`summary --strip-suffix=<sep>`**：分组前去掉 key 最后一段路径里、最后一个 `<sep>` 及其后的后缀，让 Kubernetes `<name>.<uid>` 类 key（events / services / endpoints…）按 `<name>` 聚合。只影响最后一段，中间段（如 `monitoring.coreos.com`）与 `--group-depth` 语义不变。默认空 = 关闭
+- **`summary --sort=distinct-lease-count` + `key_leased_count` / `distinct_lease_count` / `max_lease` 列**：每个 prefix 分组三个 lease 维度：`key_leased_count` = 挂了 lease 的 key 数(可加)；`distinct_lease_count` = 不同 lease id 的数量(去重)；`max_lease` = 最大 lease id(真实可 `etcdctl lease inspect` 的 id)。`key_leased_count / distinct_lease_count` 即 lease 复用度(≈1 → 每个 key 独占 lease；>>1 → 少量 lease 被大量 key 共用)。`--sort=distinct-lease-count` 按 lease 种类数排序。与 `distribute` 的 `lease==0 = persistent` 语义一致
 - **`distribute --input` / `find --input`**：消费 KeyMeta JSONL 离线分析，与 `summary --input` 对齐
 - **`core/snapshot_source.go`**：`SnapshotSource` 单次遍历全字段，照抄 `ahrtr/etcd-diagnosis` 的 `BytesToBucketKey`（~60 行）
 - **`core/wal_source.go`**：`WalSource` + `WalOp` 结构 + 全 12 种 entry-type
@@ -24,6 +26,10 @@
 
 - **`KeyMeta`** 新增 `RevCount` / `TombstoneCount` 字段，JSONL 读写适配
 - **`look` help 文本**：`--keys-only` 标注"online only; ignored with --snapshot"；`--snapshot` 说明"outputs all fields in a single pass"
+
+### Fixed
+
+- **`summary` 表头分组数**：`Summary: X keys, Y groups` 的 `Y` 之前用的是 key 总数(如 6 个 key 分成 2 组时显示"6 groups")。现在 `Y` 是真实分组数(截断时为 `top N + M others`)
 
 ### 设计决策
 

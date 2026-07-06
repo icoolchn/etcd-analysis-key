@@ -9,6 +9,13 @@ import (
 // SummaryConfig controls how a set of KeyMeta records is aggregated.
 type SummaryConfig struct {
 	GroupDepth        int
+	// StripSuffix, when non-empty, strips the trailing "<sep><suffix>" from the
+	// LAST path segment of each key before grouping. This lets keys following
+	// the Kubernetes "<name>.<uid>" convention (events, services, endpoints...)
+	// aggregate by "<name>". Only the final segment is affected; intermediate
+	// segments (e.g. "monitoring.coreos.com") and GroupDepth semantics are
+	// unchanged. Empty = off (default).
+	StripSuffix       string
 	Top               int
 	SortBy            string
 	MinCreateRevision int64
@@ -28,6 +35,9 @@ type GroupStats struct {
 	LatestModRevision int64
 	CreatedCount      int64 // keys whose create_revision is within [min,max] bounds
 	ModifiedCount     int64 // keys whose mod_revision is within [min,max] bounds
+	KeyLeasedCount    int64 // keys with a non-zero lease (lease-attached); additive
+	DistinctLeaseCount int64 // number of distinct lease ids in the group; NOT additive
+	MaxLease          int64 // max lease id of keys in the group (0 if none attached); real, inspectable id; NOT additive
 	RevCount          int64 // sum of rev_count (offline snapshot only)
 	TombstoneCount    int64 // sum of tombstone_count (offline snapshot only)
 
@@ -51,16 +61,17 @@ func (g GroupStats) AvgSize() int64 {
 
 // Valid sort keys.
 var summarySortKeys = map[string]bool{
-	"count":               true,
-	"total-size":          true,
-	"avg-size":            true,
-	"max-size":            true,
-	"max-version":         true,
-	"latest-mod-revision": true,
-	"created-count":       true,
-	"modified-count":      true,
-	"rev-count":           true,
-	"tombstone-count":     true,
+	"count":                 true,
+	"total-size":            true,
+	"avg-size":              true,
+	"max-size":              true,
+	"max-version":           true,
+	"latest-mod-revision":   true,
+	"created-count":         true,
+	"modified-count":        true,
+	"distinct-lease-count":  true,
+	"rev-count":             true,
+	"tombstone-count":       true,
 }
 
 // ValidSortKey reports whether key is a supported --sort value.
@@ -92,6 +103,31 @@ func GroupPrefix(key string, depth int) string {
 	return strings.Join(parts[:n], "/")
 }
 
+// StripLastSegmentSuffix strips the trailing "<sep><suffix>" from the LAST
+// path segment of key. With sep=".":
+//
+//	/registry/events/kyuubi/foo.abc123      -> /registry/events/kyuubi/foo
+//	/registry/events/kyuubi/foo.bar.abc123  -> /registry/events/kyuubi/foo.bar
+//	/registry/events/kyuubi/foo             -> /registry/events/kyuubi/foo  (no sep)
+//	/a/b.c/d                                -> /a/b.c/d                    (sep not in last segment)
+//
+// Only the final segment (after the last '/') is examined, so intermediate
+// segments containing sep (e.g. "monitoring.coreos.com") are left alone. The
+// last occurrence of sep in the final segment is used, so a name that itself
+// contains sep is preserved up to its final sep. Empty sep returns key
+// unchanged.
+func StripLastSegmentSuffix(key, sep string) string {
+	if sep == "" {
+		return key
+	}
+	lastStart := strings.LastIndex(key, "/") + 1
+	last := key[lastStart:]
+	if i := strings.LastIndex(last, sep); i >= 0 {
+		return key[:lastStart] + last[:i]
+	}
+	return key
+}
+
 // Summarize aggregates metas into prefix groups per cfg, returning the groups
 // sorted by cfg.SortBy (descending) and truncated to cfg.Top.
 //
@@ -112,10 +148,11 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 	}
 
 	groups := make(map[string]*GroupStats)
+	leaseSets := make(map[string]map[int64]struct{})
 	order := make([]string, 0)
 
 	for _, m := range metas {
-		g := GroupPrefix(m.Key, cfg.GroupDepth)
+		g := GroupPrefix(StripLastSegmentSuffix(m.Key, cfg.StripSuffix), cfg.GroupDepth)
 		gs, ok := groups[g]
 		if !ok {
 			gs = &GroupStats{Group: g}
@@ -136,6 +173,16 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 		if inRange(m.ModRevision, cfg.MinModRevision, cfg.MaxModRevision) {
 			gs.ModifiedCount++
 		}
+		if m.Lease != 0 {
+			gs.KeyLeasedCount++
+			gs.MaxLease = max64(gs.MaxLease, m.Lease)
+			set := leaseSets[g]
+			if set == nil {
+				set = make(map[int64]struct{})
+				leaseSets[g] = set
+			}
+			set[m.Lease] = struct{}{}
+		}
 		if m.RevCount != nil {
 			gs.RevCount += int64(*m.RevCount)
 		}
@@ -146,7 +193,9 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 
 	result := make([]GroupStats, 0, len(order))
 	for _, g := range order {
-		result = append(result, *groups[g])
+		gs := groups[g]
+		gs.DistinctLeaseCount = int64(len(leaseSets[g]))
+		result = append(result, *gs)
 	}
 
 	sortGroups(result, cfg.SortBy)
@@ -155,7 +204,8 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 		// Build the synthetic "others" row: merge the dropped tail groups so the
 		// user can see the aggregated count/size of the long tail at a glance
 		// (template 3.2 / 3.3 "others (X prefixes)" row). avg_size / max_size /
-		// max_version / max_mod_revision are left to the caller to render as "-".
+		// max_version / max_mod_revision / distinct_lease_count / max_lease are
+		// non-additive and left to the caller to render as "-".
 		dropped := result[cfg.Top:]
 		others := GroupStats{OthersCount: len(dropped)}
 		if len(dropped) > 0 && dropped[0].HasSize {
@@ -166,6 +216,7 @@ func Summarize(metas []KeyMeta, cfg SummaryConfig) []GroupStats {
 			others.TotalSize += g.TotalSize
 			others.CreatedCount += g.CreatedCount
 			others.ModifiedCount += g.ModifiedCount
+			others.KeyLeasedCount += g.KeyLeasedCount
 			others.RevCount += g.RevCount
 			others.TombstoneCount += g.TombstoneCount
 		}
@@ -211,6 +262,8 @@ func sortGroups(gs []GroupStats, by string) {
 		less = func(i, j int) bool { return gs[i].CreatedCount > gs[j].CreatedCount }
 	case "modified-count":
 		less = func(i, j int) bool { return gs[i].ModifiedCount > gs[j].ModifiedCount }
+	case "distinct-lease-count":
+		less = func(i, j int) bool { return gs[i].DistinctLeaseCount > gs[j].DistinctLeaseCount }
 	case "rev-count":
 		less = func(i, j int) bool { return gs[i].RevCount > gs[j].RevCount }
 	case "tombstone-count":
