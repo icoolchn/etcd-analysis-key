@@ -20,6 +20,28 @@ var (
 	walEntryType  string
 )
 
+// entryTypeFlagHelp is the shared --entry-type flag usage for wal-look and
+// dump wal. Lists all 17 entry types and the op_type ↔ entry_type mapping.
+const entryTypeFlagHelp = `Filter by entry type, comma-separated.
+
+IRR types (op_type ↔ entry_type):
+  Range           ↔ IRRRange          (read; not normally in WAL)
+  Put             ↔ IRRPut
+  DeleteRange     ↔ IRRDeleteRange
+  Txn             ↔ IRRTxn
+  Compaction      ↔ IRRCompaction
+  LeaseGrant      ↔ IRRLeaseGrant
+  LeaseRevoke     ↔ IRRLeaseRevoke
+  LeaseCheckpoint ↔ IRRLeaseCheckpoint
+  AuthEnable      ↔ IRRAuthEnable
+  AuthDisable     ↔ IRRAuthDisable
+  AuthUser        ↔ IRRAuthUser
+  AuthRole        ↔ IRRAuthRole
+
+Fallback: IRRUnknown, ConfigChange, Normal, Request, Unknown
+
+e.g. IRRPut,IRRDeleteRange`
+
 func NewWalLookCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "wal-look",
@@ -46,7 +68,7 @@ Examples:
 	cmd.Flags().StringVar(&walOutput, "output", "", "Output file path")
 	cmd.Flags().Uint64Var(&walStartIndex, "start-index", 0, "Start raft index (inclusive)")
 	cmd.Flags().Uint64Var(&walEndIndex, "end-index", math.MaxUint64, "End raft index (exclusive)")
-	cmd.Flags().StringVar(&walEntryType, "entry-type", "", "Filter by entry type, comma-separated (e.g. IRRPut,IRRDeleteRange)")
+	cmd.Flags().StringVar(&walEntryType, "entry-type", "", entryTypeFlagHelp)
 
 	cmd.MarkFlagRequired("data-dir")
 

@@ -75,6 +75,8 @@ func walSummaryFunc(cmd *cobra.Command, args []string) {
 		stats = stats[:walSummaryTop]
 	}
 
+	dist := core.EntryTypeDist(ops)
+
 	out := os.Stdout
 	if walSummaryOutput != "" {
 		f, err := os.OpenFile(walSummaryOutput, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
@@ -86,13 +88,24 @@ func walSummaryFunc(cmd *cobra.Command, args []string) {
 	}
 
 	if walSummaryWriteOut == "json" {
-		printWalSummaryJSON(out, stats, len(ops))
+		printWalSummaryJSON(out, stats, len(ops), dist)
 		return
 	}
-	printWalSummaryText(out, stats, len(ops))
+	printWalSummaryText(out, stats, len(ops), dist)
 }
 
-func printWalSummaryText(out *os.File, stats []core.WalKeyStats, totalOps int) {
+func printWalSummaryText(out *os.File, stats []core.WalKeyStats, totalOps int, dist []core.EntryTypeCount) {
+	if len(dist) > 0 {
+		fmt.Fprintf(out, "Entry-Type Distribution (%d total ops):\n", totalOps)
+		for _, d := range dist {
+			line := fmt.Sprintf("  %-20s %8d", d.EntryType, d.Count)
+			if d.EntryType == "IRRTxn" {
+				line += "  (parent; sub-ops already counted in IRRPut/IRRDeleteRange)"
+			}
+			fmt.Fprintln(out, line)
+		}
+		fmt.Fprintln(out)
+	}
 	fmt.Fprintf(out, "WAL Summary: %d total ops, %d unique keys (top %d by %s)\n\n", totalOps, len(stats), len(stats), walSummarySort)
 	fmt.Fprintf(out, "%-60s %10s %12s %18s\n", "Key", "PutCount", "DeleteCount", "TotalValueSize")
 	for _, s := range stats {
@@ -101,18 +114,20 @@ func printWalSummaryText(out *os.File, stats []core.WalKeyStats, totalOps int) {
 	}
 }
 
-func printWalSummaryJSON(out *os.File, stats []core.WalKeyStats, totalOps int) {
+func printWalSummaryJSON(out *os.File, stats []core.WalKeyStats, totalOps int, dist []core.EntryTypeCount) {
 	type report struct {
-		TotalOps int                 `json:"total_ops"`
-		SortBy   string              `json:"sort_by"`
-		Top      int                 `json:"top"`
-		Rows     []core.WalKeyStats  `json:"rows"`
+		TotalOps      int                  `json:"total_ops"`
+		EntryTypeDist []core.EntryTypeCount `json:"entry_type_dist"`
+		SortBy        string               `json:"sort_by"`
+		Top           int                  `json:"top"`
+		Rows          []core.WalKeyStats   `json:"rows"`
 	}
 	r := report{
-		TotalOps: totalOps,
-		SortBy:   walSummarySort,
-		Top:      walSummaryTop,
-		Rows:     stats,
+		TotalOps:      totalOps,
+		EntryTypeDist: dist,
+		SortBy:        walSummarySort,
+		Top:           walSummaryTop,
+		Rows:          stats,
 	}
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
