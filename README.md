@@ -296,7 +296,6 @@ $ etcdctl+ unmarshal --target-key by-dev/meta/channelwatch/4/by-dev-rootcoord-dm
 
 ## Documentation
 
-- [Command reference](docs/etcd-analysis-key.md)
 - [Command cheatsheet](docs/etcd-analysis-key-commands.md)
 - [Changelog](CHANGELOG.md)
 
