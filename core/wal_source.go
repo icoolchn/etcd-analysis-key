@@ -70,8 +70,28 @@ func loadNewestSnapshot(dataDir string) walpb.Snapshot {
 	return walpb.Snapshot{}
 }
 
-func walDir(dataDir string) string {
-	return filepath.Join(dataDir, "member", "wal")
+// resolveWalDir resolves --data-dir to the actual WAL directory.
+// Accepts either an etcd data directory (containing member/wal) or a WAL
+// directory (containing *.wal segment files) directly.
+func resolveWalDir(dataDir string) (string, error) {
+	// 1. etcd data dir: <dataDir>/member/wal
+	if candidate := filepath.Join(dataDir, "member", "wal"); isDir(candidate) {
+		return candidate, nil
+	}
+	// 2. already a WAL dir: contains *.wal files
+	if entries, err := os.ReadDir(dataDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
+				return dataDir, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("--data-dir %q: not an etcd data dir (no member/wal) nor a WAL dir (no *.wal files)", dataDir)
+}
+
+func isDir(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
 }
 
 // WalSource opens WAL files in the given data directory and streams decoded
@@ -83,7 +103,11 @@ func WalSource(dataDir string, opts ...WalOption) (<-chan WalOp, error) {
 	}
 
 	walsnap := loadNewestSnapshot(dataDir)
-	w, err := wal.OpenForRead(nil, walDir(dataDir), walsnap)
+	walPath, err := resolveWalDir(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	w, err := wal.OpenForRead(nil, walPath, walsnap)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}
@@ -395,4 +419,54 @@ func SortWalKeyStats(stats []WalKeyStats, sortBy string) {
 		}
 	}
 	sort.Slice(stats, less)
+}
+
+// EntryTypeCount is one row of the entry-type distribution.
+type EntryTypeCount struct {
+	EntryType string `json:"entry_type"`
+	Count     int    `json:"count"`
+}
+
+// entryTypeOrder defines the display order of entry types in the distribution
+// table: write-pressure types first (Put/Delete/Txn/Compaction), then lease and
+// auth, then the read type (Range, not normally in WAL), then fallback types.
+var entryTypeOrder = []string{
+	"IRRPut", "IRRDeleteRange", "IRRTxn", "IRRCompaction",
+	"IRRLeaseGrant", "IRRLeaseRevoke", "IRRLeaseCheckpoint",
+	"IRRAuthEnable", "IRRAuthDisable", "IRRAuthUser", "IRRAuthRole",
+	"IRRRange",
+	"IRRUnknown", "ConfigChange", "Normal", "Request", "Unknown",
+}
+
+// EntryTypeDist counts ops per entry_type, returning rows in entryTypeOrder
+// (any unseen type appended at the end in stable order). Empty entry_type is
+// skipped.
+func EntryTypeDist(ops []WalOp) []EntryTypeCount {
+	m := make(map[string]int)
+	for _, op := range ops {
+		if op.EntryType == "" {
+			continue
+		}
+		m[op.EntryType]++
+	}
+	result := make([]EntryTypeCount, 0, len(m))
+	seen := make(map[string]bool, len(m))
+	for _, t := range entryTypeOrder {
+		if c, ok := m[t]; ok {
+			result = append(result, EntryTypeCount{EntryType: t, Count: c})
+			seen[t] = true
+		}
+	}
+	// Append any unexpected types not in entryTypeOrder, sorted for stability.
+	var extra []string
+	for t := range m {
+		if !seen[t] {
+			extra = append(extra, t)
+		}
+	}
+	sort.Strings(extra)
+	for _, t := range extra {
+		result = append(result, EntryTypeCount{EntryType: t, Count: m[t]})
+	}
+	return result
 }

@@ -196,7 +196,7 @@ func newDumpWalCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "etcd data directory (required)")
-	cmd.Flags().StringVar(&entryType, "entry-type", "", "Filter by entry type, comma-separated")
+	cmd.Flags().StringVar(&entryType, "entry-type", "", entryTypeFlagHelp)
 	cmd.Flags().Uint64Var(&startIndex, "start-index", 0, "Start raft index (inclusive)")
 	cmd.Flags().Uint64Var(&endIndex, "end-index", math.MaxUint64, "End raft index (exclusive)")
 	cmd.MarkFlagRequired("data-dir")
