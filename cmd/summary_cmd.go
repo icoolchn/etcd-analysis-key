@@ -17,6 +17,7 @@ var (
 	summaryKeysOnly  bool
 	summaryPrefix    string
 	summaryGroupDepth int
+	summaryStripSuffix string
 	summaryTop       int
 	summarySort      string
 	summaryPageSize  int
@@ -53,6 +54,14 @@ Two modes:
 --group-depth=N groups by the first N path segments, e.g. for
 /registry/pods/default/nginx: depth=2 -> /registry/pods.
 
+--strip-suffix=<sep> strips the trailing "<sep><suffix>" from the LAST path
+segment before grouping, so Kubernetes "<name>.<uid>" keys (events, services,
+endpoints...) aggregate by "<name>". Example: with --strip-suffix=.,
+/registry/events/kyuubi/foo.abc123 at depth=4 groups under
+/registry/events/kyuubi/foo. Only the final segment is affected; intermediate
+segments (e.g. monitoring.coreos.com) and --group-depth semantics are
+unchanged. Empty (default) = off.
+
 Revision bounds gate the created-count / modified-count metrics (they do NOT
 filter keys out of count/size stats):
   --min-create-revision / --max-create-revision
@@ -69,8 +78,9 @@ before aggregation (client-side; does not reduce server traffic in online mode).
 	cmd.Flags().BoolVar(&summaryKeysOnly, "keys-only", false, "Online mode: only fetch key metadata (no value)")
 	cmd.Flags().StringVar(&summaryPrefix, "prefix", "", "Online mode: only scan keys with the given prefix")
 	cmd.Flags().IntVar(&summaryGroupDepth, "group-depth", 2, "Group by first N path segments")
+	cmd.Flags().StringVar(&summaryStripSuffix, "strip-suffix", "", "Strip trailing \"<sep><suffix>\" from the last path segment before grouping (e.g. \".\" to drop \".<uid>\")")
 	cmd.Flags().IntVar(&summaryTop, "top", 20, "Number of prefix groups to output")
-	cmd.Flags().StringVar(&summarySort, "sort", "count", "Sort key: count, total-size, avg-size, max-size, max-version, latest-mod-revision, created-count, modified-count, rev-count, tombstone-count")
+	cmd.Flags().StringVar(&summarySort, "sort", "count", "Sort key: count, total-size, avg-size, max-size, max-version, latest-mod-revision, created-count, modified-count, distinct-lease-count, rev-count, tombstone-count")
 	cmd.Flags().IntVar(&summaryPageSize, "page-size", core.DefaultPageSize(), "Online mode: per-request page size")
 	cmd.Flags().DurationVar(&summaryPageSleep, "page-sleep", 0, "Online mode: sleep between pages, e.g. 50ms")
 
@@ -87,7 +97,7 @@ before aggregation (client-side; does not reduce server traffic in online mode).
 	cmd.Flags().StringVar(&summaryOutput, "output", "", "Write output to file instead of stdout")
 
 	cmd.RegisterFlagCompletionFunc("sort", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-		return []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "rev-count", "tombstone-count"}, cobra.ShellCompDirectiveDefault
+		return []string{"count", "total-size", "avg-size", "max-size", "max-version", "latest-mod-revision", "created-count", "modified-count", "distinct-lease-count", "rev-count", "tombstone-count"}, cobra.ShellCompDirectiveDefault
 	})
 	cmd.RegisterFlagCompletionFunc("write-out", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		return []string{"text", "json"}, cobra.ShellCompDirectiveDefault
@@ -115,6 +125,7 @@ func summaryFunc(cmd *cobra.Command, args []string) {
 
 	cfg := core.SummaryConfig{
 		GroupDepth:        summaryGroupDepth,
+		StripSuffix:       summaryStripSuffix,
 		Top:               summaryTop,
 		SortBy:            summarySort,
 		MinCreateRevision: summaryMinCreateRev,
@@ -193,9 +204,13 @@ func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 		others = groups[shown-1].OthersCount
 		shown--
 	}
-	groupsLabel := formatThousands(total)
+	// total groups = shown top groups + dropped groups merged into "others".
+	// (Previously this used `total` — the key count — which was wrong whenever
+	// key count != group count.)
+	totalGroups := shown + others
+	groupsLabel := formatThousands(totalGroups)
 	if others > 0 {
-		groupsLabel = fmt.Sprintf("%d (top %d + %d others)", total, shown, others)
+		groupsLabel = fmt.Sprintf("%d (top %d + %d others)", totalGroups, shown, others)
 	}
 	fmt.Fprintf(out, "Summary: %s keys, %s groups by %s\n",
 		formatThousands(total), groupsLabel, summarySort)
@@ -225,7 +240,7 @@ func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 	}
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	header := "prefix\tcount\ttotal_size\tavg_size\tmax_size\tmax_version\tlatest_mod_revision\tcreated_count\tmodified_count"
+	header := "prefix\tcount\ttotal_size\tavg_size\tmax_size\tmax_version\tlatest_mod_revision\tcreated_count\tmodified_count\tkey_leased_count\tdistinct_lease_count\tmax_lease"
 	if hasRevCount {
 		header += "\trev_count\ttombstone_count"
 	}
@@ -243,16 +258,21 @@ func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 		latestMod := "-"
 		createdStr := "-"
 		modifiedStr := "-"
+		keyLeasedStr := "-"
+		distinctLeaseStr := "-"
+		maxLeaseStr := "-"
 		revStr := "-"
 		tombStr := "-"
 
 		if g.IsOthers() {
 			// others row: only additive aggregates are meaningful (template 3.2).
+			// distinct_lease_count and max_lease are non-additive -> stay "-".
 			if hasSize {
 				totalSizeStr = core.ReadableSize(int(g.TotalSize))
 			}
 			createdStr = formatThousands(int(g.CreatedCount))
 			modifiedStr = formatThousands(int(g.ModifiedCount))
+			keyLeasedStr = formatThousands(int(g.KeyLeasedCount))
 			if hasRevCount {
 				revStr = formatThousands(int(g.RevCount))
 				tombStr = formatThousands(int(g.TombstoneCount))
@@ -267,14 +287,17 @@ func printSummaryText(out *os.File, groups []core.GroupStats, total int) {
 			latestMod = fmt.Sprintf("%d", g.LatestModRevision)
 			createdStr = formatThousands(int(g.CreatedCount))
 			modifiedStr = formatThousands(int(g.ModifiedCount))
+			keyLeasedStr = formatThousands(int(g.KeyLeasedCount))
+			distinctLeaseStr = formatThousands(int(g.DistinctLeaseCount))
+			maxLeaseStr = fmt.Sprintf("%d", g.MaxLease)
 			if hasRevCount {
 				revStr = fmt.Sprintf("%d", g.RevCount)
 				tombStr = fmt.Sprintf("%d", g.TombstoneCount)
 			}
 		}
 
-		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
-			g.Group, count, totalSizeStr, avgStr, maxStr, maxVer, latestMod, createdStr, modifiedStr)
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+			g.Group, count, totalSizeStr, avgStr, maxStr, maxVer, latestMod, createdStr, modifiedStr, keyLeasedStr, distinctLeaseStr, maxLeaseStr)
 		if hasRevCount {
 			row += fmt.Sprintf("\t%s\t%s", revStr, tombStr)
 		}
@@ -338,6 +361,9 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 		LatestModRevision int64   `json:"latest_mod_revision"`
 		CreatedCount      int64   `json:"created_count"`
 		ModifiedCount     int64   `json:"modified_count"`
+		KeyLeasedCount    int64   `json:"key_leased_count"`
+		DistinctLeaseCount int64  `json:"distinct_lease_count"`
+		MaxLease          int64   `json:"max_lease"`
 		RevCount          int64   `json:"rev_count,omitempty"`
 		TombstoneCount    int64   `json:"tombstone_count,omitempty"`
 		Percent           float64 `json:"percent,omitempty"`
@@ -362,25 +388,32 @@ func printSummaryJSON(out *os.File, groups []core.GroupStats, total int) {
 	rows := make([]groupOut, 0, len(groups))
 	for _, g := range groups {
 		row := groupOut{
-			Group:             g.Group,
-			Count:             g.Count,
-			TotalSize:         g.TotalSize,
-			AvgSize:           g.AvgSize(),
-			MaxSize:           g.MaxSize,
-			MaxVersion:        g.MaxVersion,
-			LatestModRevision: g.LatestModRevision,
-			CreatedCount:      g.CreatedCount,
-			ModifiedCount:     g.ModifiedCount,
-			RevCount:          g.RevCount,
-			TombstoneCount:    g.TombstoneCount,
+			Group:              g.Group,
+			Count:              g.Count,
+			TotalSize:          g.TotalSize,
+			AvgSize:            g.AvgSize(),
+			MaxSize:            g.MaxSize,
+			MaxVersion:         g.MaxVersion,
+			LatestModRevision:  g.LatestModRevision,
+			CreatedCount:       g.CreatedCount,
+			ModifiedCount:      g.ModifiedCount,
+			KeyLeasedCount:     g.KeyLeasedCount,
+			DistinctLeaseCount: g.DistinctLeaseCount,
+			MaxLease:           g.MaxLease,
+			RevCount:           g.RevCount,
+			TombstoneCount:     g.TombstoneCount,
 		}
 		if g.IsOthers() {
 			row.IsOthers = true
 			// avg/max/version/revision are not meaningful for the merge row.
+			// key_leased_count IS additive and is preserved; distinct_lease_count
+			// and max_lease are non-additive and zeroed (rendered as 0 in JSON).
 			row.AvgSize = 0
 			row.MaxSize = 0
 			row.MaxVersion = 0
 			row.LatestModRevision = 0
+			row.DistinctLeaseCount = 0
+			row.MaxLease = 0
 		}
 		// percent: numeric, no "%" suffix (template 3.2). Only for additive dims.
 		if summarySort == "count" && totalCount > 0 {
