@@ -1,240 +1,305 @@
-# etcd-analysis
+# etcd-analysis-key
 
-etcd is generally used to store system metadata or service discovery, and is suitable for storing small key-value pairs. At the same time, etcd is sensitive to the size of key-value pairs. When storing large key-value pairs, if the number is too large, it will bring many adverse effects, such as the stability of the watch function is reduced, and a large amount of memory is occupied.
+etcd is suited to small key-value pairs such as system metadata and service discovery, and is sensitive to value size: too many large values hurt watch stability, raise memory usage, and increase fsync pressure. This tool inspects etcd data distribution and large-key problems, with low-risk online scans and offline snapshot/WAL analysis.
 
-When testing the stability of the system, it may be necessary to pay attention to the size distribution of the data currently stored in etcd by the system. That's why this project came about.
+* **Online**: keys-only scans with server-side prefix/limit pushdown and client-side aggregation, keeping production follower load low.
+* **Offline**: parse a bbolt snapshot db or WAL directly without contacting the cluster; one JSONL export can be analyzed many times.
+* **Safe**: read-only by default; high-risk commands (`clear`, `rename`) are disabled.
 
-> 内部文档见 [docs/](docs/) 目录。
+> Internal documentation: see the [docs/](docs/) directory.
 
 ## Getting started
-
-### Getting the source code
-
-```shell
-$ git clone http://git.17usoft.com/middleware_sre/etcd-analysis-key.git
-```
 
 ### Build
 
 ```shell
 $ go build -o etcdctl+
+# Cross-compile for macOS (arm64/amd64) and linux amd64
+$ make build-all
 ```
 
-### Usage
+### Quick start
 
 ```shell
 $ etcdctl+ --help
+$ etcdctl+ distribute                                  # online data distribution overview
+$ etcdctl+ summary --keys-only --group-depth=2 --sort=count --top=50
 ```
 
-> **Note:** If you encountered a panic like `` `WithPrefix` and `WithFromKey` cannot be set at the same time ``,
-> upgrading etcd client to v3.5.27 has fixed it. See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Note:** If you hit a panic like `` `WithPrefix` and `WithFromKey` cannot be set at the same time ``, upgrading the etcd client to v3.5.27 has fixed it. See [CHANGELOG.md](CHANGELOG.md).
 
-## Function List
+## Commands
 
-1. **distribute** View data distribution according to data size
-2. **look** Show or export all the etcd data, and be used with terminal or loki
-3. **find** Get key based on certain characters
-4. **leader** Get the leader node info
-5. ~~**clear**~~ Clear all the etcd data *(disabled: high-risk, irreversible)*
-6. **decode** Base64Decode the etcd value that is encoded
-7. ~~**rename**~~ Rename the etcd data key *(disabled: non-atomic, may cause inconsistency)*
-8. **unmarshal** Implement proto.Unmarshal byte array through proto source file
-
----
+| Command | Description | Mode |
+|---|---|---|
+| `distribute` | Data distribution overview (overview + histograms + percentiles + diagnosis) | Online / `--input` offline |
+| `look` | Export or view all KVs; supports keys-only, snapshot, JSONL | Online / `--snapshot` offline |
+| `summary` | Aggregate keys by prefix into Top N, multi-dimension sort | Online / `--input` offline |
+| `find` | Find keys by keyword or prefix | Online / `--input` offline |
+| `wal-look` | Export WAL operations | Offline |
+| `wal-summary` | Aggregate WAL Put/Delete counts by key | Offline |
+| `dump` | Raw data export (`list-bucket` / `iterate-bucket` / `scan-keys` / `wal`) | Offline |
+| `leader` | Get the leader node info | Online |
+| `decode` | Base64-decode an etcd value | Local |
+| `unmarshal` | Unmarshal a protobuf value via a `.proto` source file | Local |
+| ~~`clear`~~ | Clear all etcd data *(disabled: high-risk, irreversible)* | — |
+| ~~`rename`~~ | Rename an etcd key *(disabled: non-atomic, may cause inconsistency)* | — |
 
 ### distribute
 
-View data distribution in etcd according to the `key` size, `value` size or `key + value` size by setting the `type` command param.
-
-![distribute.gif](pic/20230225-150850.gif)
+Data distribution overview: scale metrics, size/version histograms with percentiles, top-prefix concentration, and a diagnosis summary.
 
 ```shell
-$ etcdctl+ distribute
+$ etcdctl+ distribute --type=kv
 
-Summary:
-  Count:        116.
-  Total:        7.3 KiB.
-  Smallest:     22.0 B.
-  Largest:      85.0 B.
-  Average:      64.0 B.
+=== Overview ===
+  Total keys:                    5,103,962
+  --- size (key) ---
+  Total key size:                 48.5 MiB
+  Avg key size:                  10B
+  key size min / max:            8B / 1.2KiB
+  key size p50 / p99:            10B / 96B
+  --- size (value) ---
+  Total value size:              2.9 GiB
+  Avg value size:                621B
+  value size min / max:          0B / 563.6KiB
+  value size p50 / p99:          619B / 656B
+  --- size (kv) ---
+  Total kv size:                 ~3 GB
+  Avg kv size:                   631B
+  kv size min / max:             8B / 564.8KiB
+  kv size p50 / p99:             629B / 656B
+  --- activity ---
+  Lease=0 (persistent):          2.60%
+  create_revision min / max:     2 / 38,788,326,159
+  mod_revision min / max:        5 / 38,788,328,082
+  max version:                   1,146,241,278
+  history_revisions (total):     online: unavailable
+  tombstone_count (total):       online: unavailable
 
-Size histogram:
-  22.0 B [1]    |
-  34.0 B [6]    |∎∎∎
-  46.0 B [29]   |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  58.0 B [13]   |∎∎∎∎∎∎∎
-  70.0 B [1]    |
-  85.0 B [66]   |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+=== Size Distribution (kv) ===
+  Size histogram:
+    22.0B  [1]    |
+    34.0B  [6]    |∎∎∎
+    46.0B  [29]   |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+    58.0B  [13]   |∎∎∎∎∎∎∎
+    70.0B  [1]    |
+    85.0B  [66]   |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+  Size distribution:
+    10% in 38.0B
+    25% in 39.0B
+    50% in 76.0B
+    75% in 83.0B
+    90% in 85.0B
+    99% in 656.0B
 
-Size distribution:
-  10% in 38.0 B.
-  25% in 39.0 B.
-  50% in 76.0 B.
-  75% in 83.0 B.
-  90% in 85.0 B.
+=== Version Distribution ===
+  Version histogram:
+    1       [5,033,382]  |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+    2~10    [16,598]     |
+    11~100  [53,972]     |
+    101~1K  [8]          |
+    1K~10K  [0]          |
+    10K+    [2]          |
+  Version distribution:
+    10% in 1
+    25% in 1
+    50% in 1
+    75% in 1
+    90% in 1
+    99% in 17
+
+=== Count Concentration (top-5 depth-2 prefixes) ===
+  /registry/events              5,049,978  (99.0%)
+  /registry/persistentvolumes      21,336  (0.42%)
+  /registry/pods                   12,381  (0.24%)
+  /registry/leases                  3,830  (0.08%)
+  /registry/services                3,769  (0.07%)
+
+=== Diagnosis ===
+  count:     ⚠️ CONCENTRATED (top-1 = 99.0% ≥ 80%)
+  size:      ✅ OK (kv p99 = 656B)
+  version:   ⚠️ WRITE HOTSPOT (max version = 1,146,241,278)
+  lease:     ✅ OK (2.6% lease=0)
 ```
 
-#### JSON output
-
-Use `--write-out=json` to get machine-readable output, suitable for scripting and automated processing:
-
-```shell
-$ etcdctl+ distribute --write-out=json
-
-{
-  "summary": {
-    "count": 116,
-    "total_bytes": 7424,
-    "smallest_bytes": 22,
-    "largest_bytes": 85,
-    "average_bytes": 64
-  },
-  "histogram": [
-    {"bucket_start": 22, "bucket_end": 34, "count": 1},
-    {"bucket_start": 34, "bucket_end": 46, "count": 6},
-    {"bucket_start": 46, "bucket_end": 58, "count": 29},
-    {"bucket_start": 58, "bucket_end": 70, "count": 13},
-    {"bucket_start": 70, "bucket_end": 85, "count": 67}
-  ],
-  "percentiles_bytes": {
-    "p10": 38,
-    "p25": 39,
-    "p50": 76,
-    "p75": 83,
-    "p90": 85
-  }
-}
-```
-
----
+`--type` controls the Size Distribution basis (`kv` default / `key` / `value`); the Overview shows all three sizes regardless. Use `--write-out=json` for machine-readable output.
 
 ### look
 
-Get all data in etcd, and you can use system tools to search.
+Export or view all etcd data. Supports keys-only (no value transfer), snapshot db parsing, and JSONL export for offline analysis.
 
 ```shell
-$ etcdctl+ look | more
-
-Current Stage
-  cluster_id:2037210783374497686 member_id:13195394291058371180 revision:254946 raft_term:9
-Kv List
-| Key | Value | Size | CreateRevision | ModRevision | Version | Lease |
-| by-dev/kv/gid/idTimestamp | - | 65 B | 253775 | 254802 | 12 | 0 |
+$ etcdctl+ look | more                                          # page through all KVs
+$ etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl   # low-risk keys-only snapshot
+$ etcdctl+ look --snapshot snapshot.db --write-out=jsonl --output=keys.jsonl  # offline full-field snapshot
+$ etcdctl+ look --filter=key --filter-min=74 --filter-max=100       # keys in a size range
 ```
 
-- Case 1:  Get all data continuously and display it on the console
+JSONL output (one KeyMeta per line; field format real, data is synthetic):
+
+```json
+{"key":"/registry/pods/default/nginx-deploy-abc","value":"-","key_size_bytes":44,"value_size_bytes":1024,"kv_size_bytes":1068,"create_revision":38762374190,"mod_revision":38762374190,"version":1,"lease":0,"rev_count":1,"tombstone_count":0}
+```
+
+`--snapshot` parses a bbolt snapshot db offline and outputs all fields (key/value sizes, `rev_count`, `tombstone_count`) in a single pass, no cluster connection needed. `--keys-only` is ignored with `--snapshot`.
+
+### summary
+
+Aggregate keys by prefix into Top N groups. Supports online scan and offline (`--input` reads a JSONL snapshot) modes.
 
 ```shell
-$ etcdctl+ look --write-out=file --hang=true
+# Online: keys-only, top prefixes by key count
+$ etcdctl+ summary --keys-only --group-depth=2 --sort=count --top=50
 
-# New Terminal
-$ vim analysis.txt
-# update the file in vim, using `:e`
+# Offline: analyze a snapshot repeatedly without touching etcd
+$ etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
+
+# K8s <name>.<uid> keys aggregated by <name> (events/services/endpoints...)
+$ etcdctl+ summary --input=keys.jsonl --prefix=/registry/events/kyuubi \
+    --strip-suffix=. --group-depth=4 --sort=count --top=10
+
+# Rank prefixes by lease diversity
+$ etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=distinct-lease-count --top=10
 ```
 
-- Case 2:  Output in log (key=value) format for scripting
+Text output (field format real, data is synthetic):
 
-```shell
-$ etcdctl+ look --write-out=log
+```text
+Summary: 12,000 keys, 3 groups by count
 
-# Output written to analysis.txt in log format:
-# key=by-dev/kv/gid/idTimestamp value=- size=65 B create_revision=253775 mod_revision=254802 version=12 lease=0
+prefix              count    total_size  avg_size  max_size  max_version  latest_mod_revision  created_count  modified_count  key_leased_count  distinct_lease_count  max_lease             rev_count  tombstone_count  percent
+/registry/events    10,000   5.9 MiB     629B      1.2KiB    1            38788328063          10,000         10,000          10,000            10,000                5821917203594880612   10,000     0                83.3%
+/registry/pods       1,500   5.3 MiB     3.6 KiB   8.0 KiB   12           38788327547          1,500          1,500           0                 0                     0                     1,500      0                12.5%
+/registry/leases       500   150 KiB     300B      350B      4            38788328038          500            500             500               1                     5821917203580688138   500        0                4.2%
 ```
 
-- Case 3:  Get the kv data of the specified size range
+Key flags:
 
-```shell
-$ etcdctl+ look --filter=key --filter-min=74 --filter-max=100
+| Flag | Default | Description |
+|---|---|---|
+| `--group-depth` | `2` | Group by the first N path segments |
+| `--strip-suffix` | off | Strip the trailing `<sep><suffix>` from the last path segment before grouping (e.g. `.` drops `.<uid>`) |
+| `--top` | `20` | Output the top N groups |
+| `--sort` | `count` | `count`, `total-size`, `avg-size`, `max-size`, `max-version`, `latest-mod-revision`, `created-count`, `modified-count`, `distinct-lease-count`, `rev-count`, `tombstone-count` |
+| `--min/max-create-revision` | `0` | Bounds for `created-count` |
+| `--min/max-mod-revision` | `0` | Bounds for `modified-count` |
+| `--input` | off | JSONL snapshot file (offline mode); empty = online scan |
+| `--keys-only` | `false` | Online: fetch key metadata only |
+| `--prefix` | off | Online: server-side prefix scan |
+| `--write-out` | `text` | `text` / `json` |
 
-Current Stage
-  cluster_id:2037210783374497686 member_id:13195394291058371180 revision:326021 raft_term:14
-Kv List
-| Key | Value | Size | CreateRevision | ModRevision | Version | Lease |
-| by-dev/meta/channelwatch/.../by-dev-rootcoord-dml_4_435191634150817793v0 | - | 75 B | 326013 | 326013 | 1 | 0 |
-```
+Lease columns (always shown; consistent with `distribute`'s `lease==0 = persistent`):
 
----
+| Column | Description |
+|---|---|
+| `key_leased_count` | Keys with a non-zero lease (additive; summed in the `others` row) |
+| `distinct_lease_count` | Number of distinct lease ids (non-additive; `-` in `others`) |
+| `max_lease` | Largest lease id, a real `etcdctl lease inspect`-able id (non-additive; `-` in `others`) |
+
+`key_leased_count / distinct_lease_count` is the lease-reuse factor: ≈1 → each key has its own lease; >>1 → few leases shared by many keys.
+
+> **Production workflow:** For large clusters, export once with `look --keys-only --write-out=jsonl --output=keys.jsonl`, then analyze the JSONL offline with `summary --input=keys.jsonl` to avoid re-scanning etcd each time.
 
 ### find
 
-Get key based on certain characters
+Find keys by keyword (`--match-key`) or prefix (`--prefix`).
 
-> **Note:** The `--key` flag has been renamed to `--match-key` to avoid collision with the global TLS `--key` flag.  
-> If you previously used `etcdctl+ find --key=xxx`, use `etcdctl+ find --match-key=xxx` instead.
+> **Note:** The `--key` flag was renamed to `--match-key` to avoid colliding with the global TLS `--key` flag.
 
 ```shell
-$ etcdctl+ find --match-key=index
-Kv List
-| Key | Value |
-| by-dev/meta/field-index/438660758500016136/438660903999573339 |  |
-| by-dev/meta/segment-index/438660758500016136/438660758500016137/438660758500216145/438660903999573340 |  |
+$ etcdctl+ find --match-key=index --limit=10
 ```
 
----
+### wal-look
+
+Export WAL operations from an etcd data directory.
+
+```shell
+$ etcdctl+ wal-look --data-dir /var/lib/etcd \
+    --start-index 1000 --end-index 2000 \
+    --write-out=jsonl --output=wal.jsonl
+```
+
+JSONL output (one WalOp per line; field format real, data is synthetic). Operations like `Compaction` carry no `key`/`value_size_bytes`:
+
+```json
+{"raft_index":1500,"raft_term":3,"op_type":"Put","key":"/registry/pods/default/nginx-deploy-abc","value_size_bytes":1024,"entry_type":"IRRPut"}
+{"raft_index":1501,"raft_term":3,"op_type":"Compaction","entry_type":"IRRCompaction"}
+{"raft_index":1502,"raft_term":3,"op_type":"Delete","key":"/registry/pods/default/nginx-deploy-def","value_size_bytes":0,"entry_type":"IRRDeleteRange"}
+```
+
+`--entry-type` filters by entry type (comma-separated, e.g. `IRRPut,IRRDeleteRange`).
+
+### wal-summary
+
+Aggregate WAL Put/Delete counts per key, from a WalOp JSONL or by parsing WAL directly.
+
+```shell
+$ etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+$ etcdctl+ wal-summary --data-dir /var/lib/etcd --sort=delete-count --top=20
+```
+
+Text output (field format real, data is synthetic):
+
+```text
+WAL Summary: 8,000 total ops, 3,500 unique keys (top 10 by put-count)
+
+key                                              put_count  delete_count  total_ops
+/registry/pods/default/nginx-deploy-abc          2,500            50       2,550
+/registry/pods/default/nginx-deploy-def          1,200             0       1,200
+/registry/events/default/job-run-xyz             1,000           900       1,900
+...
+```
+
+`--sort`: `put-count` (default) / `delete-count` / `total-ops`.
+
+### dump
+
+Raw data export from a snapshot db or WAL.
+
+```shell
+$ etcdctl+ dump list-bucket --snapshot snapshot.db
+$ etcdctl+ dump iterate-bucket --snapshot snapshot.db --decode --limit 100
+$ etcdctl+ dump scan-keys --snapshot snapshot.db --start-revision 100 --end-revision 200 --limit 50
+$ etcdctl+ dump wal --data-dir /var/lib/etcd --start-index 1000 --end-index 2000
+```
 
 ### leader
 
-Get the leader node info
-
 ```shell
 $ etcdctl+ leader
-
 Name: default
 ClientUrls: [http://127.0.0.1:2379]
 ```
 
----
+### decode
 
-### clear *(disabled)*
+Base64-decode an etcd value.
 
-> This command has been disabled due to high risk (deletes ALL etcd data, irreversible).
-> Source code is preserved; uncomment `rootCmd.AddCommand(NewClearCmd())` in `cmd/root_cmd.go` to re-enable.
-
----
-
-### rename *(disabled)*
-
-> This command has been disabled due to high risk (non-atomic Get→Put→Delete, may cause data inconsistency).
-> Source code is preserved; uncomment `rootCmd.AddCommand(NewRenameCmd())` in `cmd/root_cmd.go` to re-enable.
-
----
+```shell
+$ etcdctl+ decode --value=<base64-value>
+```
 
 ### unmarshal
 
-Implement proto.Unmarshal byte array through proto source file.
+Unmarshal a protobuf value via a `.proto` source file, without compiling Go code.
 
-> **Note:** The `--key` flag has been renamed to `--target-key` to avoid collision with the global TLS `--key` flag.  
-> If you previously used `etcdctl+ unmarshal --key=xxx`, use `etcdctl+ unmarshal --target-key=xxx` instead.
-
-Generally speaking, we store some system meta information in etcd, and the stored pseudocode is:
-
-```go
-segBytes, _ := proto.Marshal(*foopb.SystemInfo{})
-etcdclient.put("foo/system", segBytes)
-```
-
-When we query, we cannot clearly see the value in the struct. Of course, it can be easily implemented through code. You only need to import the relevant pb file and then call the proto.Unmarshal method to see the clear value. But many times we may not have the environment, or writing this part of the code will waste a little time.
-
-The unmarshal instruction will solve this trouble. You only need to copy the proto source file to quickly view the value in the struct:
+> **Note:** The `--key` flag was renamed to `--target-key` to avoid colliding with the global TLS `--key` flag.
 
 ```shell
 $ etcdctl+ unmarshal --target-key by-dev/meta/channelwatch/4/by-dev-rootcoord-dml_0_445337303926193462v0 \
     --import-path ../birdwatcher/proto/v2.2 \
     --proto ../birdwatcher/proto/v2.2/data_coord.proto \
     --full-message-name milvus.protov2.data.ChannelWatchInfo
-
-vchan: collectionID:445337303926193462 channelName:"by-dev-rootcoord-dml_0_445337303926193462v0" ...
-startTs: 1698912217
-state: 3
-timeoutTs: 0
-progress: 0
 ```
 
-- `--target-key`: the etcd full key
-- `--import-path`: all proto directory
-- `--proto`: the proto file path where the message is located
-- `--full-message-name`: the full message name, usually a combination of proto package name and message
+## Documentation
 
----
+- [Command reference](docs/etcd-analysis-key.md)
+- [Command cheatsheet](docs/etcd-analysis-key-commands.md)
+- [Changelog](CHANGELOG.md)
 
+## License
 
+etcd-analysis-key is under the Apache 2.0 license. See the [LICENSE](LICENSE) file for details.

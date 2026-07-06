@@ -24,12 +24,19 @@ etcd-analysis 是一个 **etcd 数据分析 CLI 工具**（二进制名 `etcdctl
 │  root_cmd.go ─── 全局 flag (endpoints, TLS, timeout)│
 │      ├── distribute_cmd.go   数据大小分布分析        │
 │      ├── look_cmd.go         查看/导出全量数据       │
+│      │                       + --snapshot 离线入口   │
 │      ├── find_cmd.go         按关键字搜索 key        │
+│      ├── summary_cmd.go      按前缀聚合 Top N        │
 │      ├── leader_cmd.go       查询 leader 节点信息    │
-│      ├── clear_cmd.go        清空所有数据            │
+│      ├── clear_cmd.go        清空所有数据（已禁用）  │
 │      ├── decode_cmd.go       Base64 解码            │
-│      ├── rename_cmd.go       重命名 key              │
-│      └── unmarshal_cmd.go    Proto 反序列化          │
+│      ├── rename_cmd.go       重命名 key（已禁用）    │
+│      ├── unmarshal_cmd.go    Proto 反序列化          │
+│      ├── wal_look_cmd.go     WAL 操作流导出          │ ← 离线新增
+│      ├── wal_summary_cmd.go  WAL 按 key 聚合统计     │ ← 离线新增
+│      └── dump_cmd.go         原始数据导出            │ ← 离线新增
+│           ├── list-bucket / iterate-bucket / scan-keys│
+│           └── wal                                     │
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
@@ -39,13 +46,20 @@ etcd-analysis 是一个 **etcd 数据分析 CLI 工具**（二进制名 `etcdctl
 │  etcd_op.go     ─── etcd CRUD 操作封装 (带超时)      │
 │  report.go      ─── 统计报表引擎 (直方图/百分位)      │
 │  percent.go     ─── 百分位数计算 (P10~P99)           │
+│  meta.go        ─── KeyMeta 记录 + jsonl 读写 + log  │
+│  filter.go      ─── 共享 size 过滤 (look/summary)    │
+│  summary.go     ─── 前缀聚合引擎 (GroupStats/Sort)   │
 │  util.go        ─── 通用工具函数                     │
+│  snapshot_source.go ─ 快照 db 离线解析 (bbolt)       │ ← 离线新增
+│  wal_source.go  ─── WAL 离线解析 + WalOp            │ ← 离线新增
+│  revision.go    ─── BytesToBucketKey + tombstone     │ ← 离线新增
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
 │            etcd client/v3 (官方 SDK)                │
 │         protoreflect (proto 动态解析)               │
 │            uilive (终端实时刷新输出)                  │
+│            bbolt (快照 db 只读解析)                  │ ← 离线新增
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -125,18 +139,22 @@ etcd 数据流 ──→ results channel ──→ processResults() ──→ �
 
 ---
 
-## 四、8 个子命令原理
+## 四、子命令原理
 
 | 命令 | 功能 | 核心原理 |
 |------|------|---------|
-| **distribute** | 数据大小分布分析 | 流式读取 → Report 统计 → 直方图 + 百分位实时渲染 |
-| **look** | 查看/导出全量数据 | 流式读取 → 表格输出 (stdout/file/log)，支持 filter 按大小过滤，hang 模式定时刷新 |
-| **find** | 按关键字搜索 key | 流式读取 → `strings.Contains` 匹配，支持 prefix + limit |
+| **distribute** | 数据大小分布分析 | 流式读取 → Report 统计 → 直方图 + 百分位实时渲染；支持 `--prefix` 限定范围 |
+| **look** | 查看/导出全量数据 | 在线：流式读取 → 表格/log/jsonl 输出；`--keys-only` 不拉 value，`--prefix` server-side 限定，`--filter` 客户端过滤，hang 模式定时刷新。离线：`--snapshot` 解析 bbolt db，一次遍历输出全字段（含 rev_count/tombstone_count） |
+| **find** | 按关键字搜索 key | 流式读取 → `strings.Contains` 匹配；`--limit` 下推到 etcd server（`WithLimit`），大 prefix 安全 |
+| **summary** | 按前缀聚合 Top N | 在线扫描或读 `--input` JSONL 快照 → 按 `--group-depth` 聚合 → `--sort` 排序输出 Top N；支持 revision 过滤 |
 | **leader** | 查询 leader 节点 | `MemberList` + `Status` 获取 leader ID → 匹配 member 信息 |
-| **clear** | 清空所有数据 | 先 `WithCountOnly` 统计数量 → 确认 → `Delete(WithFromKey)` 全删 |
+| **clear** | 清空所有数据（已禁用） | 先 `WithCountOnly` 统计数量 → 确认 → `Delete(WithFromKey)` 全删 |
 | **decode** | Base64 解码 | 纯本地 `base64.StdEncoding.DecodeString`，不需要连接 etcd |
-| **rename** | 重命名 key | Get 旧值 → Put 新 key → 可选备份到 `etcd-bak/` 前缀 → Delete 旧 key |
+| **rename** | 重命名 key（已禁用） | Get 旧值 → Put 新 key → 可选备份到 `etcd-bak/` 前缀 → Delete 旧 key |
 | **unmarshal** | Proto 反序列化 | Get 原始字节 → `protoparse` 解析 .proto 源文件 → `dynamic.Message` 动态反序列化 → 打印字段 |
+| **wal-look** | WAL 操作流导出（离线） | 解析 WAL 日志 → 逐条输出 WalOp（raft_index/op_type/key/value_size_bytes）；支持 `--entry-type` 过滤、`--start/end-index` 范围 |
+| **wal-summary** | WAL 按 key 聚合统计（离线） | 从 WalOp JSONL 或直接解析 WAL → 按 key 聚合 Put/Delete 次数 → `--sort=put-count/delete-count` 排序 Top N |
+| **dump** | 原始数据导出（离线） | 子命令集：`list-bucket`（列 bucket）、`iterate-bucket`（逐条导出 + size 增强）、`scan-keys`（按 revision 扫描）、`wal`（WAL 条目原始输出）。纯文本，不参与 JSONL 分析管线 |
 
 **unmarshal 命令是最有特色的**——它不需要编译 proto 代码，只需要提供 `.proto` 源文件路径，利用 `jhump/protoreflect` 做动态解析和反序列化，解决了"etcd 中存的是 protobuf 序列化数据，无法直接阅读"的痛点。
 
@@ -153,20 +171,36 @@ etcd 数据流 ──→ results channel ──→ processResults() ──→ �
        ▼
   子命令 Run 函数
        │
-       ├── core.InitClient()  ──→  建立 etcd v3 client 连接 (随机选 endpoint)
-       │                            └── EtcdStatus() 健康检查
+       ├─── 在线路径 ──────────────────────────────────────────────
+       │    ├── core.InitClient()  ──→  建立 etcd v3 client 连接 (随机选 endpoint)
+       │    │                            └── EtcdStatus() 健康检查
+       │    │
+       │    ├── core.GetAllData() / GetDataWithPrefix()  ──→  流式分页读取
+       │    │       │
+       │    │       └── chan []*mvccpb.KeyValue  (生产者-消费者模式)
+       │    │
+       │    └── 业务逻辑处理
+       │           ├── distribute: 喂入 Report → 统计 → 直方图/百分位
+       │           ├── look:       过滤 → 格式化表格/log/jsonl → 写 stdout/file
+       │           ├── find:       strings.Contains 匹配 → 输出（limit 下推 server）
+       │           ├── summary:    KeyMeta 聚合 → GroupStats → Top N 排序输出
+       │           ├── unmarshal:  protoreflect 动态解析 → 打印结构化字段
+       │           └── 其他:       直接调用 etcd_op 封装
        │
-       ├── core.GetAllData() / GetDataWithPrefix()  ──→  流式分页读取
-       │       │
-       │       └── chan []*mvccpb.KeyValue  (生产者-消费者模式)
+       ├─── 离线路径（snapshot db）─────────────────────────────────
+       │    ├── look --snapshot:  core.SnapshotSource(dbPath)
+       │    │       │              └── 只读 bbolt → Unmarshal → 去重 + rev_count 聚合
+       │    │       └── chan []*mvccpb.KeyValue（同在线，消费层零改动）
+       │    │
+       │    └── JSONL 管线（加载一次，分析多次）
+       │           look --snapshot → KeyMeta JSONL → summary/distribute/find --input
        │
-       └── 业务逻辑处理
-              │
-              ├── distribute: 喂入 Report → 统计 → 直方图/百分位
-              ├── look:       过滤 → 格式化表格 → 写 stdout/file/log
-              ├── find:       strings.Contains 匹配 → 输出
-              ├── unmarshal:  protoreflect 动态解析 → 打印结构化字段
-              └── 其他:       直接调用 etcd_op 封装
+       ├─── 离线路径（WAL）─────────────────────────────────────────
+       │    ├── wal-look:   core.WalSource(dataDir) → chan WalOp → JSONL
+       │    └── wal-summary: 读 WalOp JSONL → 按 key 聚合 Put/Delete 次数
+       │
+       └─── 离线路径（dump）────────────────────────────────────────
+            └── dump:  list-bucket / iterate-bucket / scan-keys / wal → 纯文本原始导出
 ```
 
 ---
@@ -180,14 +214,18 @@ etcd 数据流 ──→ results channel ──→ processResults() ──→ �
 3. **实时终端渲染**：利用 `uilive` 库在 distribute 命令中每 100ms 刷新输出，用户体验好
 4. **Proto 动态反序列化**：unmarshal 命令不需要编译目标 proto，直接用源文件解析，实用性很强
 5. **随机 endpoint**：分散读压力，避免单节点过载
+6. **keys-only + prefix + summary 三段式低风险排查**：改造后优先 keys-only 快照、server-side prefix/limit 下推、summary 聚合，只对可疑前缀拉 value，显著降低生产 follower 读取风险
+7. **JSONL 快照 + 离线多次分析**：`look --write-out=jsonl` 一次导出，`summary --input` 反复多维分析，避免重复扫描 etcd
 
 **不足：**
 
 1. **无认证支持**：不支持 etcd 的 user/password 认证，只能连无认证或 TLS 认证的集群
 2. **全局变量较多**：`core` 包大量使用包级全局变量（`client`、`C`），不利于测试和并发
-3. **rename 非原子**：rename 操作是 Get→Put→Delete 三步，非事务操作，中途失败会留下不一致状态
-4. **clear 无 prefix 选项**：只能清空全部数据，无法按前缀清理
+3. **rename 非原子**：rename 操作是 Get→Put→Delete 三步，非事务操作，中途失败会留下不一致状态（已禁用该命令）
+4. **clear 无 prefix 选项**：只能清空全部数据，无法按前缀清理（已禁用该命令）
 5. **错误处理粗暴**：大量 `core.Exit(err)` 直接 `os.Exit(-1)`，没有优雅的资源清理
+6. **TLS 证书验证默认跳过**：配 TLS 即 `InsecureSkipVerify=true`，存在中间人风险；计划改为显式 `--insecure-skip-tls-verify` flag，尚未落地
+7. **endpoint 选择仍为随机**：未提供 `--endpoint-pick=first|random`，排查时需手动只传一个 follower endpoint
 
 ---
 
@@ -212,11 +250,13 @@ go build -o etcdctl+
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--endpoints` | `127.0.0.1:2379` | etcd 集群地址，多个用逗号分隔 |
+| `--endpoints` | `127.0.0.1:2379` | etcd 集群地址，多个用逗号分隔（排查生产建议只传一个 follower，避免随机选到 leader） |
 | `--cert` | 空 | TLS 客户端证书文件 |
 | `--key` | 空 | TLS 客户端私钥文件 |
 | `--cacert` | 空 | TLS CA 证书文件 |
 | `--command-timeout` | `5` | 操作超时时间（秒） |
+
+> ⚠️ **TLS 证书验证现状：** 当前一旦配置 `--cert`/`--key`/`--cacert`，客户端会无条件设置 `InsecureSkipVerify=true`，跳过服务端证书验证。自签证书 / 主机名不匹配场景下可用，但存在中间人风险，跨环境（QA/生产）使用时需注意。后续计划改为显式 `--insecure-skip-tls-verify` flag（默认严格验证），目前尚未落地。
 
 ```bash
 # 连接远程 etcd
@@ -243,12 +283,20 @@ etcdctl+ distribute --type=value --bucket=8
 
 # 按 key+value 合计大小分布
 etcdctl+ distribute --type=kv
+
+# 离线模式：从 JSONL 快照分析（不连 etcd）
+etcdctl+ distribute --input=snapshot.jsonl --type=kv
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--type` | `key` | 统计维度：`key` / `value` / `kv` |
 | `--bucket` | `5` | 直方图桶数 |
+| `--write-out` | `text` | 输出格式：`text` / `json` |
+| `--input` | 空 | JSONL 快照文件（离线模式）；空=在线扫描。消费 `look --write-out=jsonl` 或 `look --snapshot --write-out=jsonl` 导出的 KeyMeta JSONL |
+| `--prefix` | 空 | server-side 前缀扫描，不再只能全量扫（仅在线模式） |
+| `--page-size` | `1000` | 每页读取 key 数；低峰期可调大减少 Range 次数（仅在线模式） |
+| `--page-sleep` | `0` | 页间 sleep（如 `50ms`），降低对 follower 瞬时压力（仅在线模式） |
 
 **输出示例：**
 
@@ -432,11 +480,26 @@ etcdctl+ look --write-out=file
 # 持续监听，每 2 秒刷新一次（仅 file 模式生效）
 etcdctl+ look --write-out=file --hang=true --hang-interval=5
 
-# 只看 value 大小在 74~100 字节之间的数据
+# 只看 value 大小在 74~100 字节之间的数据（客户端过滤，仍会拉 value）
 etcdctl+ look --filter=key --filter-min=74 --filter-max=100
 
 # 输出为日志格式（适合 loki 等日志系统采集）,"log" 和 "file" 均是文件写入
 etcdctl+ look --write-out=log
+
+# 只扫某个前缀（server-side，不全量扫）
+etcdctl+ look --prefix=/registry/events --write-out=log
+
+# keys-only：只拉 key metadata，不拉 value（低风险快照）
+etcdctl+ look --keys-only --write-out=log
+
+# 导出 keys-only JSONL 快照，供 summary --input 离线反复分析
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
+
+# 导出某前缀 full metadata JSONL（含 value size，不含 value 内容）
+etcdctl+ look --prefix=/registry/events --write-out=jsonl --output=events-kv-meta.jsonl
+
+# 离线 snapshot db 分析：一次遍历输出全字段（含 rev_count + tombstone_count）
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=snapshot.jsonl
 
 # 配合管道使用
 etcdctl+ look | more
@@ -446,12 +509,18 @@ etcdctl+ look | vim -
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--show-value` | `false` | 是否显示 value（base64 编码） |
-| `--write-out` | `stdout` | 输出方式：`stdout` / `file` / `log` |
-| `--hang` | `false` | 持续刷新（需配合 `--write-out=file`） |
+| `--write-out` | `stdout` | 输出方式：`stdout` / `file` / `log` / `jsonl` |
+| `--output` | 空 | `file`/`log`/`jsonl` 写入的文件路径（默认 `analysis.txt` / `analysis.jsonl`） |
+| `--hang` | `false` | 持续刷新（需配合 `--write-out=file`，仅在线模式） |
 | `--hang-interval` | `2` | 刷新间隔（秒） |
-| `--filter` | `none` | 大小过滤维度：`none` / `key` / `value` / `kv` |
+| `--filter` | `none` | 大小过滤维度：`none` / `key` / `value` / `kv`（客户端过滤，仍会拉 value） |
 | `--filter-min` | `-1` | 最小值（字节） |
 | `--filter-max` | `-1` | 最大值（字节） |
+| `--keys-only` | `false` | 只拉 key metadata，不拉 value（底层 `WithKeysOnly()`），低风险快照。仅在线模式生效；离线 `--snapshot` 模式静默忽略（详见 8.2 keys-only 说明） |
+| `--snapshot` | 空 | 离线模式：解析 bbolt snapshot db 文件。一次遍历输出全字段（含 value size + rev_count + tombstone_count），不连集群 |
+| `--prefix` | 空 | server-side 前缀扫描，限定范围（仅在线模式） |
+| `--page-size` | `1000` | 每页读取 key 数（仅在线模式） |
+| `--page-sleep` | `0` | 页间 sleep（如 `50ms`）（仅在线模式） |
 
 **输出示例（stdout 模式）：**
 
@@ -463,11 +532,48 @@ Kv List
 | /config/server | - | 85.0 B | 1 | 1 | 1 | 0 |
 ```
 
-**输出示例（log 模式）：**
+**输出示例（log 模式，拆分 size 字段后）：**
 
 ```
-key=/config/server value=- size=85.0 B create_revision=1 mod_revision=1 version=1 lease=0
+key=/config/server value=- key_size_bytes=13 value_size_bytes=0 kv_size_bytes=13 kv_size_human=13B create_revision=1 mod_revision=1 version=1 lease=0
 ```
+
+**输出示例（keys-only + log 模式，省略 value 相关字段）：**
+
+```
+key=/config/server key_size_bytes=13 create_revision=1 mod_revision=1 version=1 lease=0
+```
+
+> 📌 **size 字段已拆分：** 早期 `size` 字段含义会随 `--filter` 改变（key/value/kv），对离线脚本不友好。改造后 log/jsonl 统一输出 `key_size_bytes` / `value_size_bytes` / `kv_size_bytes` / `kv_size_human`，含义固定，不再随 filter 变化。keys-only 模式下 value 相关字段省略。
+
+#### 7.4.1 输出字段含义
+
+look 命令每行输出的 7 个字段（对应 etcd 内部 mvcc 的 KV 结构，也可通过 `etcdctl get <key> -w json` 得到），逐字段含义如下：
+
+| 字段 | 示例值 | 含义 |
+|------|--------|------|
+| `key` | `/qaenv` | 这个键的名字 |
+| `value` | `-` | 该键对应的值。`-` 是 look 表格/log 输出对“空 value”的占位符，实际 value 为空字节串，不是字符串 `"-"` |
+| `size` | `6.0B` | value 的存储大小（human-readable 显示；`--filter` 过滤的也是这个 size） |
+| `create_revision` | `35630` | 该 key **首次被创建**时的全局修订号（revision）。只要这个 key 没被删除再重建，此值不变 |
+| `mod_revision` | `35630` | 该 key **最后一次被修改**时的全局修订号，每次 PUT 都会更新。等于 `create_revision` 说明自创建后再没被修改过 |
+| `version` | `1` | 该 key 自最近一次创建以来被**修改的次数**。`1` 表示只创建、未更新过（每改一次 +1；删除重建后重置为 1） |
+| `lease` | `0` | 关联的租约 ID。`0` 表示**没有绑定 lease**，即这个 key 是持久化的，不会因某个租约过期而被自动删除 |
+
+**三个 revision/version 字段最容易混淆，区别如下：**
+
+- **`create_revision`**：key 第一次被写入时集群的全局 revision，跟着 key 的“生命周期”走，删除后重建会变。
+- **`mod_revision`**：key 最近一次被改写时集群的全局 revision，每次 PUT 都会更新。
+- **`version`**：从这次创建算起，被改写了几次。
+
+三者关系：当 `create_revision == mod_revision` 且 `version == 1` 时，可以判定这个 key 是“一次性写入后从未被修改”的——上面那条 `/config/server` 正是这种情况。
+
+**关于 `value=-` 和 `size`：**
+
+- `value=-` 在 look 输出里代表空 value，真实 value 为空字节串。
+- `size` 是 value 的字节数（表格/log 模式下人性化显示带单位）。注意 etcd 对单个 value 的存储还会包含 key + 元数据开销，但 look 显示的 `size` 通常指 value 本身大小。
+
+**一句话总结：** 上面这行表示 `/qaenv` 是一个**值为空、创建后从未修改过（version=1）、未绑定租约（持久存储）**的普通键，它是在集群全局 revision 为 `35630` 时被写入的。
 
 ⚠️ 性能提示： look 会全量读取 etcd 所有数据，数据量大时对集群读压力较大。建议先用 distribute --type=kv 查看数据总量和条数，数据量大时（几十万条+）谨慎使用 look，避免对生产集群造成过大读压力。
 
@@ -482,6 +588,9 @@ etcdctl+ find --match-key=index --value
 
 # 限制返回数量
 etcdctl+ find --match-key=index --limit=50
+
+# 离线模式：从 JSONL 快照搜索（不连 etcd）
+etcdctl+ find --input=snapshot.jsonl --match-key=starrocks
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -489,13 +598,105 @@ etcdctl+ find --match-key=index --limit=50
 | `--match-key` | 空 | 搜索关键字（包含匹配） |
 | `--prefix` | 空 | key 前缀过滤 |
 | `--value` | `false` | 是否显示 value |
-| `--limit` | `10` | 最大返回数量 |
+| `--limit` | `10` | 最大返回数量（在线模式下推到 etcd server 作为 Range `WithLimit`，大 prefix 也安全） |
+| `--input` | 空 | JSONL 快照文件（离线模式）；空=在线扫描。消费 `look --write-out=jsonl` 或 `look --snapshot --write-out=jsonl` 导出的 KeyMeta JSONL |
 
 > ⚠️ **Breaking Change：** 修复前版本使用 `--key`，与全局 TLS `--key` 冲突，TLS 环境下会导致连接失败。
 > - 修复前：`etcdctl+ find --key=index`（TLS 环境下有 bug）
 > - 修复后：`etcdctl+ find --match-key=index`
 
-### 7.6 `unmarshal` — Proto 反序列化
+### 7.6 `summary` — 按前缀聚合 Top N
+
+**改造新增的核心分析命令**，把全量 key 按前缀分组聚合，只输出 Top N，避免导出全量明细。支持两种模式：
+
+- **在线模式**：不传 `--input`，直接连 etcd 扫描（建议加 `--keys-only` + `--prefix`）。
+- **离线模式**：传 `--input=<jsonl>`，从 `look --write-out=jsonl` 导出的快照分析，不访问 etcd，可对同一份快照反复多维分析。
+
+```bash
+# 在线便捷模式：keys-only 聚合 key 数最多的前缀
+etcdctl+ summary --keys-only --group-depth=2 --sort=count --top=50
+
+# 离线模式：基于 keys-only 快照反复分析
+etcdctl+ summary --input=keys.jsonl --group-depth=2 --sort=count --top=50
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
+
+# 某时间点后修改/新增最多的前缀（revision 来自 Grafana）
+etcdctl+ summary --input=keys.jsonl --min-mod-revision=38770000000 --group-depth=3 --sort=count --top=50
+etcdctl+ summary --input=keys.jsonl --min-create-revision=38770000000 --group-depth=3 --sort=count --top=50
+
+# 可疑前缀空间占用（需含 value size 的快照）
+etcdctl+ summary --input=events-kv-meta.jsonl --group-depth=3 --sort=total-size --top=50
+
+# JSON 输出
+etcdctl+ summary --input=keys.jsonl --sort=count --write-out=json --output=summary.json
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--input` | 空 | JSONL 快照文件（离线模式）；空=在线扫描 |
+| `--keys-only` | `false` | 在线模式只拉 key metadata，不拉 value |
+| `--prefix` | 空 | 在线模式 server-side 前缀扫描 |
+| `--group-depth` | `2` | 按前 N 段路径聚合 |
+| `--strip-suffix` | 空 | 分组前去掉最后一段路径里、最后一个 `<sep>` 及其后的后缀。如 `.` 让 K8s `<name>.<uid>` key 按 `<name>` 聚合；只动最后一段，中间段与 depth 语义不变 |
+| `--top` | `20` | 输出前 N 个分组（不是 N 个 key） |
+| `--sort` | `count` | 排序键，见下表 |
+| `--min-create-revision` / `--max-create-revision` | `0` | create_revision 范围，影响 `created-count` |
+| `--min-mod-revision` / `--max-mod-revision` | `0` | mod_revision 范围，影响 `modified-count` |
+| `--filter` / `--filter-min` / `--filter-max` | `none` / `-1` / `-1` | 客户端过滤（不减少 server 返回量） |
+| `--page-size` / `--page-sleep` | `1000` / `0` | 仅在线模式 |
+| `--write-out` | `text` | `text` / `json` |
+| `--output` | 空 | 写文件（默认 stdout） |
+
+**`--group-depth` 分组规则**（以 `/registry/pods/default/nginx` 为例）：
+
+| depth | 分组前缀 |
+|---|---|
+| 1 | `/registry` |
+| 2 | `/registry/pods` |
+| 3 | `/registry/pods/default` |
+| 4 | `/registry/pods/default/nginx` |
+
+K8s 场景建议：`--group-depth=2` 看资源类型，`--group-depth=3` 看资源类型 + namespace。
+
+| `--sort` 取值：
+
+| sort | 用途 |
+|---|---|
+| `count` | key 数最多的前缀 |
+| `total-size` / `avg-size` / `max-size` | 占用最大 / 平均大 / 单个大对象（需含 value 的快照） |
+| `max-version` | 高频覆盖写热点前缀 |
+| `latest-mod-revision` | 最近活跃修改的前缀 |
+| `created-count` / `modified-count` | 配合 `--min-*-revision` 找某 revision 后新增/修改最多的前缀 |
+| `distinct-lease-count` | 组内不同 lease id 数最多的前缀（lease 种类最杂） |
+| `rev-count` | 历史 revision 数最多的前缀（离线 snapshot JSONL；在线快照无此字段） |
+| `tombstone-count` | tombstone 数最多的前缀（离线 snapshot JSONL；在线快照无此字段） |
+
+**lease 三列**（常驻显示，与 `distribute` 的 `lease==0 = persistent` 语义一致）：`key_leased_count`（挂 lease 的 key 数，可加）/ `distinct_lease_count`（不同 lease id 数，不可加）/ `max_lease`（最大 lease id，真实可 `etcdctl lease inspect`，不可加）。`key_leased_count / distinct_lease_count` 即 lease 复用度：≈1 → 每个 key 独占 lease；>>1 → 少量 lease 被大量 key 共用。others 行：`key_leased_count` 求和，`distinct_lease_count`/`max_lease` 显示 `-`。
+
+**输出示例（text）：**
+
+```
+Summary: 2090000 keys, 15 groups (top 15 by count)
+
+prefix | count | total_size | avg_size | max_size | max_version | latest_mod_revision | created_count | modified_count | key_leased_count | distinct_lease_count | max_lease | rev_count | tombstone_count | percent
+/registry/events | 980000 | - | - | - | 3 | 38780000020 | 0 | 0 | 980000 | 980000 | 5821917203594880612 | 980000 | 0 | 99.0%
+/registry/pods | 530000 | - | - | - | 1024 | 38780000010 | 0 | 0 | 0 | 0 | 0 | 530000 | 0 | 0.5%
+...
+```
+
+keys-only 快照没有 value size，`TotalSize`/`AvgSize`/`MaxSize` 显示 `-`；`rev_count`/`tombstone_count` 仅离线 snapshot JSONL 有值（在线/普通 keys-only 快照这两列不显示）。用 `look --prefix=... --write-out=jsonl`（不带 `--keys-only`）导出的快照才有 size 列。
+
+**`--strip-suffix` 用法**：K8s `<name>.<uid>` 类 key（events/services/endpoints…）默认 `--group-depth=4` 会因 `<uid>` 唯一而每个 key 各成一组。加 `--strip-suffix=.` 剥掉最后一段的 `.<uid>`，同一 `<name>` 的 key 才会合并：
+
+```bash
+# kyuubi events 按事件系列名聚合（同 name 的多个 event 合并）
+etcdctl+ summary --input=keys.jsonl --prefix=/registry/events/kyuubi \
+    --strip-suffix=. --group-depth=4 --sort=count --top=10
+```
+
+> 📌 **生产推荐流程：** 大集群优先 `look --keys-only --write-out=jsonl --output=keys.jsonl` 在线导出一次，再用 `summary --input=keys.jsonl` 离线多维分析，避免每次 summary 都重新扫描 etcd。在线 summary 定位为小集群/小前缀/临时确认的便捷模式。详见第八章。
+
+### 7.7 `unmarshal` — Proto 反序列化
 
 **最实用的特色功能**，直接用 `.proto` 源文件反序列化 etcd 中的 protobuf 数据，无需编译 Go 代码。
 
@@ -540,7 +741,7 @@ etcdctl+ unmarshal \
 > - 修复前：`etcdctl+ unmarshal --key=/registry/pods/default/my-pod`（TLS 环境下有 bug）
 > - 修复后：`etcdctl+ unmarshal --target-key=/registry/pods/default/my-pod`
 
-### 7.7 `leader` — 查询 leader 节点
+### 7.8 `leader` — 查询 leader 节点
 
 ```bash
 etcdctl+ leader
@@ -555,7 +756,7 @@ ClientUrls: [http://127.0.0.1:2379]
 
 **用途：** 快速确认集群当前 leader，排查脑裂或切换问题。
 
-### 7.8 `decode` — Base64 解码
+### 7.9 `decode` — Base64 解码
 
 ```bash
 # look 命令 --show-value 输出的值是 base64 编码的，用 decode 解码
@@ -571,7 +772,7 @@ decode value:
 
 **注意：** 这个命令不需要连接 etcd，纯本地操作。
 
-### 7.9 `rename` — 重命名 key
+### 7.10 `rename` — 重命名 key
 
 ```bash
 # 重命名（默认备份旧 key 到 etcd-bak/ 前缀下）
@@ -589,7 +790,7 @@ etcdctl+ rename --source-key=/old/key --target-key=/new/key --bak=false
 
 > ⚠️ **注意：** 此操作非原子（Get→Put→Delete），中途失败可能产生不一致。建议始终开启 `--bak`。
 
-### 7.10 `clear` — 清空所有数据
+### 7.11 `clear` — 清空所有数据
 
 ```bash
 etcdctl+ clear
@@ -608,48 +809,353 @@ Clear All Data, (Y/n): Y   # 必须输入大写 Y 确认
 
 ## 八、典型使用场景
 
-### 场景 1：排查 etcd 性能问题 — 发现大 value
+### 8.1 场景覆盖关系
+
+| 排查目标 | 影响 | 核心命令 | 修复建议 |
+|---|---|---|---|
+| DB size 增长 | 接近 quota 触发 NOSPACE；snapshot/restore/defrag 时间变长 | `summary --sort=count/total-size` | Prometheus 区分真实增长 vs 碎片：碎片增长 → 低峰期 compact + 逐节点 defrag；真实增长 → 定位大头前缀后推动业务清理（如过期 events、废弃 CRD） |
+| revision rate 高 | WAL/fsync、apply、watch event 压力升高 | `summary --sort=max-version`、`--min-mod-revision` | 定位热点前缀后推动业务降低写频率；心跳/状态上报类改 Lease KeepAlive 替代高频 Put；无意义轮询写改为 watch + 按需更新 |
+| 大量 watcher event | 慢 watcher、pending event、客户端消费延迟 | `summary --sort=latest-mod-revision/max-version` | 先治理写入源（同 revision rate）；消费慢则排查客户端处理逻辑、拆分 watch 范围、加消费并发；客户端来源需结合 apiserver audit |
+| 高频覆盖写 | DB in-use 不一定增长，但 revision/WAL/watch 持续增长 | `summary --sort=max-version` | 业务治理：降低更新频率、合并写入、状态心跳改 Lease；确认是否真需要每次写（如 leader election 可拉长周期）；必要时迁移到更适合高频写的存储 |
+| 大量新增 key | DB in-use 同步增长，可能由事件、任务、临时对象堆积导致 | `summary --min-create-revision --sort=count` | 业务治理：确认泄漏源（如 events 未配 TTL、Job/Pod 创建后不清理）；加 TTL / ownerReference 自动清理；控制创建速率；必要时调整 `--event-ttl` 或清理策略 |
+| 大 value | DB size、网络传输、watch 内存和反序列化开销升高 | `distribute --type=value` + `summary --sort=max-size` | 业务治理：缩小 value（如清理冗余 annotation/managedFields）；拆分大对象到 ConfigMap/Secret 外部存储；避免在 etcd value 中嵌入日志/二进制内容 |
+| 历史 revision 堆积（含 tombstone） | compaction 前历史 revision 占用 DB 空间；删除重建型热点 version=1 看不出来 | `look --snapshot` + `summary --sort=rev-count/tombstone-count` | 离线 snapshot db 分析：`rev-count` 定位高 revision 数的 key；`tombstone-count` 定位频繁删除的 key |
+| WAL 写入热点 | WAL 持续增长、fsync 延迟升高 | `wal-look` + `wal-summary --sort=put-count` | 定位 Put 次数最多的 key 后推动业务降低写频率；区分 Put/Delete/Txn 操作类型，针对性优化 |
+| WAL 操作类型分布 | 需要了解写入模式：以 Put 为主还是 Delete/Txn 为主 | `wal-summary --sort=put-count/delete-count` | 大量 Delete → 检查是否有批量清理任务冲击；大量 Txn → 检查事务是否可简化 |
+
+### 8.2 通用排查流程
+
+排查分三种数据源，按需选择：
+
+**在线分析**（生产大集群三步：Prometheus → keys-only 快照 → 离线 summary）：
 
 ```bash
-# 第一步：看 value 大小分布
+# 第一步：导出 keys-only 快照（在线扫一次，不拉 value）
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl \
+  --endpoints=<follower> --page-sleep=50ms
+
+# 第二步：离线多维分析（不再访问 etcd，可反复跑）
+etcdctl+ summary --input=keys.jsonl --group-depth=2 --sort=count --top=50
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
+etcdctl+ summary --input=keys.jsonl --min-mod-revision=<rev> --sort=count --top=50
+
+# 第三步：对可疑前缀再拉 value size（按需）
+etcdctl+ look --prefix=/registry/events --write-out=jsonl --output=events.jsonl
+etcdctl+ summary --input=events.jsonl --sort=total-size --top=50
+```
+
+**离线 snapshot db 分析**（完全不连集群，一次导出全部字段）：
+
+```bash
+# 导出 snapshot → 一次遍历输出全部字段（含 value size + rev_count + tombstone_count）
+etcdctl snapshot save cluster.db
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=snapshot.jsonl
+
+# 多次分析（不再访问 db）
+etcdctl+ summary --input=snapshot.jsonl --group-depth=2 --sort=count --top=50
+etcdctl+ summary --input=snapshot.jsonl --sort=rev-count --top=50
+etcdctl+ distribute --input=snapshot.jsonl --type=kv
+```
+
+**离线 WAL 分析**（分析写操作流：Put/Delete/Txn 类型和频次）：
+
+```bash
+# 导出 WAL → 离线分析
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+```
+
+小集群/测试环境可以跳过导出，直接在线 summary：
+
+```bash
+etcdctl+ summary --keys-only --group-depth=2 --sort=count --top=50
+```
+
+> **keys-only 说明**：`--keys-only` 仅用于**在线分析**——etcd Range API 的 `WithKeysOnly()` 让 server 端跳过 value 内容传输，减少网络开销。**离线 `look --snapshot` 不需要 `--keys-only`**：bbolt 遍历必须 `proto.Unmarshal` 才能拿到 key 名，Unmarshal 后 `len(kv.Value)` 几乎零成本，因此离线默认输出全部字段（含 value size + rev_count + tombstone_count），一次导出即可覆盖所有分析维度。
+
+> **三种数据源的互补关系**：在线分析看当前态（version/mod_revision 等存量指标）；snapshot db 离线分析能看到在线看不到的历史 revision 数和 tombstone（compaction 前的全部修改历史）；WAL 分析看最近的写操作流（Put/Delete/Txn 类型、频次、按 key 聚合），三者互补。
+
+### 8.3 生产安全原则
+
+1. **优先 follower**：只传单个 follower endpoint
+2. **低峰期执行**
+3. **先 keys-only 后 value**：先用 keys-only 找到可疑前缀，再对可疑前缀拉 value metadata
+4. **避免 `look --hang`**：不要持续全量扫描
+5. **离线优先**：200 集群批量巡检场景用 `etcdctl snapshot save` 拷副本 → 本地 `look --snapshot` 分析，完全不影响集群
+
+---
+
+### 场景 1：排查大 value
+
+```text
+问题：etcd DB 变大、watch 延迟、客户端读取慢，怀疑有大 value。
+```
+
+**在线分析**：
+
+```bash
+# 看 value 大小分布
 etcdctl+ distribute --type=value --bucket=10
 
-# 发现大量 value > 1MB → 定位具体是哪些 key
-etcdctl+ look --filter=value --filter-min=1048576 --show-value
+# 定位大 value 所在 key
+etcdctl+ look --filter=value --filter-min=1048576 --write-out=log
 
-# 解码大 value 的内容（如果是 protobuf）
-etcdctl+ decode --value="<base64 value>"
-# 或（修复后版本）
+# 对可疑前缀聚合 value size
+etcdctl+ look --prefix=/registry/configmaps --write-out=jsonl --output=configmaps.jsonl
+etcdctl+ summary --input=configmaps.jsonl --group-depth=3 --sort=max-size --top=50
+
+# 解码大 value 内容
+etcdctl+ decode --value=”<base64 value>”
 etcdctl+ unmarshal --target-key=/problematic/key --import-path=... --proto=... --full-message-name=...
-# 修复前版本：etcdctl+ unmarshal --key=/problematic/key --import-path=... --proto=... --full-message-name=...
 ```
 
-### 场景 2：运维巡检 — 监控 etcd 数据增长
+**离线 snapshot db 分析**：
 
 ```bash
-# 持续导出全量数据到文件，配合 vim/tail 观察
-etcdctl+ look --write-out=file --hang=true --hang-interval=30
-
-# 另一个终端
-tail -f analysis.txt
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=cluster.jsonl
+etcdctl+ summary --input=cluster.jsonl --group-depth=3 --sort=max-size --top=50
+etcdctl+ distribute --input=cluster.jsonl --type=value
 ```
 
-### 场景 3：数据迁移/清理
+> `look --filter=value` 是客户端过滤，底层仍会拉 value。生产环境建议先用 `distribute --prefix=<可疑前缀>` 缩小范围，或用离线 snapshot 分析。
+
+---
+
+### 场景 2：DB size 增长定位
+
+```text
+问题：etcd_mvcc_db_total_size_in_bytes 持续增长。
+```
+
+先用 Prometheus 区分真实增长 vs 碎片增长：
+
+```promql
+etcd_mvcc_db_total_size_in_bytes                    -- db_total
+etcd_mvcc_db_total_size_in_use_in_bytes              -- db_in_use
+etcd_debugging_mvcc_keys_total or etcd_mvcc_keys_total
+```
+
+- `db_total` 和 `db_in_use` 同时增长 → 真实数据增长
+- `db_total` 增长但 `db_in_use` 不变 → 碎片，走 compact + defrag
+- `keys_total` 同步增长 → 大量新增 key
+
+**在线分析**：
 
 ```bash
-# 查看集群 leader
+# keys-only 快照 → 找 key 数大头
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
+etcdctl+ summary --input=keys.jsonl --group-depth=2 --sort=count --top=50
+
+# key 数不能解释 DB 增长 → 对可疑前缀拉 value size
+etcdctl+ look --prefix=/registry/events --write-out=jsonl --output=events.jsonl
+etcdctl+ summary --input=events.jsonl --group-depth=3 --sort=total-size --top=50
+```
+
+**离线 snapshot db 分析**（一次导出即可看 size + revision 堆积）：
+
+```bash
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=snapshot.jsonl
+etcdctl+ summary --input=snapshot.jsonl --group-depth=2 --sort=count --top=50
+
+# 历史 revision 排行：找删除重建型热点（在线 version=1 看不出来）
+etcdctl+ summary --input=snapshot.jsonl --sort=rev-count --top=50
+```
+
+---
+
+### 场景 3：revision rate 高 / 高频覆盖写
+
+```text
+问题：rate(current_revision[5m]) 升高，或少量 key 被频繁 PUT（version 很高但 key 数和 DB 不增长）。
+```
+
+Prometheus 确认：
+
+```promql
+rate(etcd_debugging_mvcc_current_revision[5m])   -- 或 etcd_mvcc_current_revision
+rate(etcd_mvcc_put_total[5m])
+```
+
+如果能从 Grafana 拿到高峰开始时间对应的 revision（如 `18:30_rev = 38770000000`）：
+
+**在线分析**：
+
+```bash
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
+
+# 高 version 热点前缀
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
+
+# 指定时间点后修改最多的前缀
+etcdctl+ summary --input=keys.jsonl --min-mod-revision=38770000000 --group-depth=3 --sort=count --top=50
+
+# 最近活跃前缀（没有 revision 时的替代）
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=latest-mod-revision --top=50
+```
+
+**离线 WAL 分析**（看最近写操作的真实 Put 次数，比 version 更直接）：
+
+```bash
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+```
+
+---
+
+### 场景 4：大量新增 key / 某类资源过多
+
+```text
+问题：keys_total 快速增长，或总 key 数很高需要定位大头。
+```
+
+**在线分析**：
+
+```bash
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
+
+# 按资源类型聚合
+etcdctl+ summary --input=keys.jsonl --group-depth=2 --sort=count --top=50
+
+# 按 namespace 下钻
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=count --top=50
+
+# 指定 revision 后新增最多的前缀
+etcdctl+ summary --input=keys.jsonl --min-create-revision=<start_rev> --group-depth=3 --sort=count --top=50
+```
+
+**离线 snapshot db 分析**（批量巡检 200 集群时用 snapshot 副本，不连集群）：
+
+```bash
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=snapshot.jsonl
+etcdctl+ summary --input=snapshot.jsonl --group-depth=2 --sort=count --top=50
+```
+
+---
+
+### 场景 5：watcher event 升高
+
+```text
+问题：watch 消息量、mvcc events 指标升高。
+```
+
+Prometheus 判断 watcher 是被写入带起来还是消费慢：
+
+```promql
+rate(etcd_debugging_mvcc_events_total[5m])
+etcd_debugging_mvcc_slow_watcher_total
+```
+
+**在线分析**：
+
+```bash
+etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
+
+# 找最近活跃写入前缀
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=latest-mod-revision --top=50
+
+# 找高频覆盖写前缀
+etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
+```
+
+**离线 WAL 分析**（直接看最近一段时间的写操作流）：
+
+```bash
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+
+# 按 key 聚合 Put 次数，找真正的写入热点
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+```
+
+> etcd 存量数据只能定位写入前缀，不能直接定位 watcher 客户端 IP。客户端来源需结合 apiserver audit 或业务日志。
+
+---
+
+### 场景 6：历史 revision 堆积 / 删除重建热点
+
+```text
+问题：compaction 不及时导致历史 revision 堆积占用 DB；或某些 key 反复删除重建，version 重置为 1 在线看不出来。
+```
+
+这是**在线分析的盲区**——在线 Range 只返回当前态，看不到历史 revision 数。必须用离线 snapshot db 分析。
+
+```bash
+# 导出 snapshot
+etcdctl snapshot save cluster.db
+
+# 一次导出全部字段（含 rev_count + tombstone_count）
+etcdctl+ look --snapshot=cluster.db --write-out=jsonl --output=snapshot.jsonl
+
+# 历史 revision 排行：找 revision 数最多的 key
+etcdctl+ summary --input=snapshot.jsonl --sort=rev-count --top=50
+
+# tombstone 排行：找被删除次数最多的 key
+etcdctl+ summary --input=snapshot.jsonl --sort=tombstone-count --top=50
+
+# 原始数据查看
+etcdctl+ dump iterate-bucket --snapshot=cluster.db key --limit=20
+```
+
+> **为什么在线看不到**：etcd v3 在线 Range 每个 key 只返回一条最新值，`version` 字段在删除重建后重置为 1。只有离线遍历 bbolt 的 key bucket 才能看到 compaction 前的全部历史 revision，包括 tombstone 条目。
+
+---
+
+### 场景 7：WAL 写入热点分析
+
+```text
+问题：WAL 持续增长、fsync 延迟升高，需要定位写入最多的 key。
+```
+
+```bash
+# 导出 WAL 操作流
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+
+# 按 key 聚合 Put 次数排行
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+
+# 只看某个 index 范围内的操作
+etcdctl+ wal-look --data-dir=/var/lib/etcd --start-index=930 --end-index=1000 --write-out=jsonl --output=wal-range.jsonl
+
+# 按操作类型过滤
+etcdctl+ wal-look --data-dir=/var/lib/etcd --entry-type=IRRPut,IRRDeleteRange --write-out=jsonl --output=wal-writes.jsonl
+etcdctl+ wal-summary --input=wal-writes.jsonl --sort=put-count --top=50
+
+# 原始 WAL 条目查看
+etcdctl+ dump wal --data-dir=/var/lib/etcd --entry-type=IRRPut --start-index=930 --end-index=932
+```
+
+> **WAL vs 在线 version 的区别**：在线 `version` 是 key 自最近创建以来的修改次数（删除重建后重置），WAL 记录的是 raft 日志中每次实际写操作，不受重置影响。WAL 覆盖最近几个 snapshot 周期的数据，历史范围比 snapshot db 短。
+
+---
+
+### 场景 8：WAL 操作类型分布
+
+```text
+问题：需要了解集群写入模式——以 Put 为主还是 Delete/Txn 为主，用于容量规划或异常排查。
+```
+
+```bash
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+
+# Put 热点
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+
+# Delete 热点
+etcdctl+ wal-summary --input=wal.jsonl --sort=delete-count --top=50
+
+# 快速一步分析（不导出 JSONL，但每次都重新解析 WAL）
+etcdctl+ wal-summary --data-dir=/var/lib/etcd --sort=put-count --top=50
+```
+
+---
+
+### 场景 9：数据迁移 / 清理前确认
+
+```bash
 etcdctl+ leader
-
-# 搜索待清理的 key（修复后版本）
 etcdctl+ find --match-key=deprecated --prefix=/old-system --limit=100
-# 修复前版本：etcdctl+ find --key=deprecated --prefix=/old-system --limit=100
-
-# 重命名迁移
-etcdctl+ rename --source-key=/old/key --target-key=/new/key
-
-# 确认无误后清理（谨慎！）
-etcdctl+ clear
 ```
+
+注意：`clear` 和 `rename` 属于高风险写操作，当前文档建议禁用或仅在明确授权和备份后使用。
 
 ---
 
@@ -820,141 +1326,7 @@ Size histogram:
 
 ---
 
-## 十一、etcd client v3.5.0 `WithPrefix` 误判 Bug 分析
-
-### 11.1 Bug 现象
-
-执行 `distribute` 命令时触发 panic：
-
-```
-panic: `WithPrefix` and `WithFromKey` cannot be set at the same time, choose one
-```
-
-### 11.2 根因
-
-etcd client v3.5.0 用**反射 + 字符串包含**判断是否传入了某个 option：
-
-```go
-// etcd client v3.5.0 utils.go
-func isOpFuncCalled(op string, opts []OpOption) bool {
-    for _, opt := range opts {
-        v := reflect.ValueOf(opt)           // 拿到闭包的反射值
-        if v.Kind() == reflect.Func {
-            if opFunc := runtime.FuncForPC(v.Pointer()); opFunc != nil {
-                if strings.Contains(opFunc.Name(), op) {  // 用 Contains 匹配函数名
-                    return true
-                }
-            }
-        }
-    }
-    return false
-}
-```
-
-Go 运行时给闭包命名时，**会带上外层函数名**。当在 `GetDataWithPrefix` 函数内调用 `WithFromKey()` 时，闭包的实际名称为：
-
-```
-main.GetDataWithPrefix.WithFromKey.func3
-      ^^^^^^^^^^^^^^^
-      外层函数名包含 "WithPrefix"
-```
-
-因此检测逻辑发生误判：
-
-```
-IsOptsWithPrefix(opts)?
-  → 遍历所有 option，检查函数名是否包含 "WithPrefix"
-  → WithFromKey 闭包名 = "main.GetDataWithPrefix.WithFromKey.func3"
-  → strings.Contains("...GetDataWithPrefix.WithFromKey...", "WithPrefix") = true ❌ 误判！
-
-IsOptsWithFromKey(opts)?
-  → strings.Contains("...GetDataWithPrefix.WithFromKey...", "WithFromKey") = true ✅ 正确
-
-两个都 true → panic！
-```
-
-**同理，`WithSerializable` 和 `WithLimit` 的闭包名也被误判为 "WithPrefix"：**
-
-```
-main.GetDataWithPrefix.WithSerializable.func1  → Contains("WithPrefix") = true ❌
-main.GetDataWithPrefix.WithLimit.func2         → Contains("WithPrefix") = true ❌
-main.GetDataWithPrefix.WithFromKey.func3       → Contains("WithPrefix") = true ❌
-```
-
-### 11.3 触发链路
-
-```
-用户执行: etcdctl+ distribute
-    │
-    ▼
-cmd/distribute_cmd.go
-    core.GetAllData()  →  core.GetDataWithPrefix("")    ← prefix 为空
-    │
-    ▼
-core/data_source.go  GetDataWithPrefix(prefix)
-    if prefix == "":
-        opts = append(opts, clientv3.WithFromKey())     ← 加 WithFromKey
-    resp, err := EtcdGet(client, start, opts...)         ← 触发 panic
-    │
-    ▼
-etcd client v3.5.0  OpGet(key, opts...)
-    IsOptsWithPrefix(opts) && IsOptsWithFromKey(opts)    ← 误判！
-    → panic
-```
-
-### 11.4 触发条件
-
-| 条件 | 说明 |
-|------|------|
-| **etcd client 版本** | ≤ v3.5.0（v3.5.15 确认已修复） |
-| **项目代码** | 在函数名包含 `WithPrefix` 的函数内调用 `WithFromKey()` |
-| **具体命令** | `distribute`、`look`、`find`（无 prefix 时）都会走 `GetAllData()` → `GetDataWithPrefix("")` |
-| **代码路径** | `prefix == ""` → 走 `WithFromKey()` 分支，才会同时被误判为 `WithPrefix` |
-| **带 prefix 不会触发** | `find --prefix=xxx` 走 `WithPrefix()` 分支，没有 `WithFromKey`，不会冲突 |
-
-### 11.5 v3.5.15+ 的修复方式
-
-不再依赖反射和字符串匹配，改为在闭包内部直接设置 bool 标记：
-
-```go
-// v3.5.15 op.go
-type Op struct {
-    ...
-    isOptsWithPrefix  bool   // 新增字段
-    isOptsWithFromKey bool   // 新增字段
-}
-
-func WithPrefix() OpOption {
-    return func(op *Op) {
-        op.isOptsWithPrefix = true    // 直接标记，不再依赖函数名
-        ...
-    }
-}
-
-func WithFromKey() OpOption {
-    return func(op *Op) {
-        op.isOptsWithFromKey = true   // 直接标记
-        ...
-    }
-}
-```
-
-### 11.6 修复方案
-
-升级 etcd client 到 v3.5.27（已验证编译通过、运行正常）：
-
-```
-etcd client:  v3.5.0 → v3.5.27
-go directive:  1.18  → 1.24
-grpc:         v1.57 → v1.71
-protobuf:     v1.31 → v1.36
-```
-
-不需要修改项目代码，纯依赖升级即可。etcd 客户端版本不需要和服务端版本完全一致，v3.5.27 的客户端可以连 v3.4/v3.5/v3.6 的服务端。
-
----
-
-## 十二、注意事项
+## 十一、注意事项
 
 1. **无密码认证**：不支持 etcd 的 `--auth` 模式，只能连无认证或 TLS 认证的集群
 2. **distribute 读全量数据**：会对集群产生读压力，生产环境建议在非高峰期使用
@@ -964,139 +1336,3 @@ protobuf:     v1.31 → v1.36
 6. **先用 distribute 评估数据量，再决定是否跑 look**：distribute 和 look 都会全量读取 etcd 数据，distribute 只读一次且输出统计摘要，look 会返回所有 KV 数据。建议先用 `distribute --type=kv` 查看数据总量和条数，数据量大时（几十万条+）谨慎使用 look，避免对生产集群造成过大读压力
 
 ---
-
-## 十三、`--key` Flag 冲突 Bug 分析
-
-### 13.1 Bug 现象
-
-使用 TLS 连接 etcd 时，`find` 和 `unmarshal` 命令报 TLS 握手失败：
-
-```bash
-./etcdctl+ \
-  --endpoints=https://endpoints.etcd.qa.17usoft.com:5211 \
-  --cert=client.pem \
-  --key=client-key.pem \
-  --cacert=ca.pem \
-  find --key=qa
-```
-
-报错：
-
-```
-tls: failed to verify certificate: x509: "etcd" certificate is not standards compliant
-Error: unvaliable etcd server, error: context deadline exceeded
-```
-
-而 `leader`、`distribute`、`look` 等命令同样使用 TLS 连接却完全正常。
-
-### 13.2 根因
-
-**全局 flag 和子命令 flag 同名冲突，导致 TLS 私钥路径被覆盖。**
-
-```go
-// cmd/root_cmd.go:31 — 全局 PersistentFlag
-rootCmd.PersistentFlags().StringVar(&core.C.TLS.KeyFile, "key", "", "identify secure client using this TLS key file")
-
-// cmd/find_cmd.go:31 — find 子命令 LocalFlag
-cmd.Flags().StringVar(&findKey, "key", "", "Show the data like the key")
-
-// cmd/unmarsha_cmd.go:29 — unmarshal 子命令 LocalFlag
-cmd.Flags().StringVar(&unmarshallKey, "key", "", "the proto.marshal value of the full key")
-```
-
-Cobra 的行为：**子命令的 LocalFlag 同名时会覆盖 PersistentFlag**。
-
-当执行：
-
-```bash
-./etcdctl+ --key=client-key.pem find --key=qa
-```
-
-`--key=qa` 把全局 TLS `--key` 从 `client-key.pem` 覆盖成了 `"qa"`，导致客户端证书加载失败，TLS 握手直接报错。
-
-### 13.3 触发条件
-
-必须**同时满足**两个条件：
-
-| 条件 | 说明 |
-|------|------|
-| 1. 使用 TLS 连接 | 传了全局 `--key`（TLS 私钥），flag 才有值可被覆盖 |
-| 2. 子命令使用了 `--key` | `find --key=xxx` 或 `unmarshal --key=xxx` 覆盖全局值 |
-
-```bash
-# 不连 TLS → 全局 --key 为空，find --key=qa 覆盖空值，无影响
-etcdctl+ find --key=qa                                    # ✅ 正常
-
-# 连 TLS 但子命令不用 --key → 全局 --key 不被覆盖
-etcdctl+ --key=client-key.pem find                        # ✅ 正常
-
-# 连 TLS + 子命令用 --key → 💥 全局 --key 被覆盖
-etcdctl+ --key=client-key.pem find --key=qa               # ❌ TLS 握手失败
-```
-
-作者大概率只在无 TLS 的本地环境测试，所以从未发现此 bug。
-
-### 13.4 项目中 key 相关 flag 命名格式全览
-
-| 命令 | flag 名 | 语义 | "key" 的角色 | 格式 |
-|------|---------|------|-------------|------|
-| **root (全局)** | `--key` | TLS 私钥 | — | 单词 |
-| distribute | `--type=key` | 按 key 大小统计 | key 是**维度/类别** | `--<维度>=key` |
-| look | `--filter=key` | 按 key 大小过滤 | key 是**维度/类别** | `--<维度>=key` |
-| find | `--key=qa` ⚠️ | 模糊匹配搜索 key | key 是**目标** | 单词（冲突） |
-| unmarshal | `--key=/path/to/key` ⚠️ | 指定完整 key 查询 | key 是**目标** | 单词（冲突） |
-| rename | `--source-key=xxx` | 源 key | key 是**目标** | `--<修饰>-key` |
-| rename | `--target-key=xxx` | 目标 key | key 是**目标** | `--<修饰>-key` |
-
-### 13.5 命名规律
-
-- key 作为**维度/类别**时 → `--<维度>=key`（如 `--type=key`、`--filter=key`）
-- key 作为**目标对象**时 → `--<修饰>-key=<值>`（如 `--source-key`、`--target-key`）
-
-find 和 unmarshal 的 `--key` 都是"目标对象"，应按第二种格式。
-
-`--type=key` 和 `--filter=key` 不合适的原因：
-
-- `--type=key` 在 distribute 里是"统计维度"，find 的语义不是维度
-- `--filter=key` 在 look 里是"过滤属性"，unmarshal 的语义不是过滤条件
-
-### 13.6 修复建议
-
-| 命令 | 原 flag | 建议 flag | 理由 |
-|------|---------|----------|------|
-| find | `--key` | `--match-key` | 模糊匹配目标 key，和 `--source-key`/`--target-key` 风格一致 |
-| unmarshal | `--key` | `--target-key` | 精确查询目标 key，和 rename 的 `--target-key` 完全同义 |
-
-### 13.7 修改文件
-
-#### `cmd/find_cmd.go`
-
-```go
-// 修改前
-cmd.Flags().StringVar(&findKey, "key", "", "Show the data like the key")
-
-// 修改后
-cmd.Flags().StringVar(&findKey, "match-key", "", "Show the data like the match key")
-```
-
-#### `cmd/unmarsha_cmd.go`
-
-```go
-// 修改前
-cmd.Flags().StringVar(&unmarshallKey, "key", "", "the proto.marshal value of the full key")
-
-// 修改后
-cmd.Flags().StringVar(&unmarshallKey, "target-key", "", "the target key of the etcd data")
-```
-
-### 13.8 使用方式变化
-
-```bash
-# 修改前
-etcdctl+ find --key=qa
-etcdctl+ unmarshal --key=/registry/pods/default/my-pod ...
-
-# 修改后
-etcdctl+ find --match-key=qa
-etcdctl+ unmarshal --target-key=/registry/pods/default/my-pod ...
-```
