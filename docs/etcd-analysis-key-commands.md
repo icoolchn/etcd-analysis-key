@@ -1,219 +1,238 @@
-# etcd-analysis 子命令速查表
+# etcd-analysis Command Cheatsheet
 
-## 子命令总览
+## Command Overview
 
-| 命令 | 功能 | 操作类型 | flag | 可选参数 |
-|------|------|---------|------|---------|
-| **distribute** | 数据大小分布分析 | 只读 | `--type` | `key`（默认）、`value`、`kv` |
-| | | | `--bucket` | 整数（默认 `5`） |
-| | | | `--write-out` | `text`（默认）、`json` |
-| | | | `--prefix` | 字符串（server-side 前缀扫描） |
-| | | | `--page-size` | 整数（默认 `1000`，每页 key 数） |
-| | | | `--page-sleep` | duration（默认 `0`，如 `50ms`） |
-| **look** | 查看/导出全量数据 | 只读 | `--show-value` | `true`、`false`（默认） |
-| | | | `--write-out` | `stdout`（默认）、`file`、`log`、`jsonl` |
-| | | | `--output` | 文件路径（`file`/`log`/`jsonl` 写入） |
-| | | | `--hang` | `true`、`false`（默认） |
-| | | | `--hang-interval` | 整数，单位秒（默认 `2`） |
-| | | | `--filter` | `none`（默认）、`key`、`value`、`kv`（客户端过滤） |
-| | | | `--filter-min` | 整数，单位字节（默认 `-1` 不限制） |
-| | | | `--filter-max` | 整数，单位字节（默认 `-1` 不限制） |
-| | | | `--keys-only` | `true`、`false`（默认），只拉 key metadata，不拉 value |
-| | | | `--prefix` | 字符串（server-side 前缀扫描） |
-| | | | `--page-size` | 整数（默认 `1000`） |
-| | | | `--page-sleep` | duration（默认 `0`，如 `50ms`） |
-| **summary** | 按前缀聚合 Top N | 只读 | `--input` | JSONL 快照文件（离线模式；空=在线扫描） |
-| | | | `--keys-only` | `true`、`false`（默认，仅在线模式，不拉 value） |
-| | | | `--prefix` | 字符串（仅在线模式，server-side 前缀） |
-| | | | `--group-depth` | 整数（默认 `2`，按前 N 段路径聚合） |
-| | | | `--strip-suffix` | 字符串（默认空=关闭，如 `.` 去掉最后一段路径里的 `.<uid>` 后缀再分组） |
-| | | | `--top` | 整数（默认 `20`，输出前 N 个分组） |
-| | | | `--sort` | `count`（默认）、`total-size`、`avg-size`、`max-size`、`max-version`、`latest-mod-revision`、`created-count`、`modified-count`、`distinct-lease-count`、`rev-count`、`tombstone-count` |
-| | | | `--min-create-revision` / `--max-create-revision` | int64（默认 `0` 不限制） |
-| | | | `--min-mod-revision` / `--max-mod-revision` | int64（默认 `0` 不限制） |
-| | | | `--filter` / `--filter-min` / `--filter-max` | 客户端过滤（默认 `none` / `-1` / `-1`） |
-| | | | `--page-size` / `--page-sleep` | 仅在线模式 |
-| | | | `--write-out` | `text`（默认）、`json` |
-| | | | `--output` | 文件路径（默认 stdout） |
-| **find** | 按关键字搜索 key | 只读 | `--match-key` | 字符串（模糊匹配） |
-| | | | `--prefix` | 字符串（key 前缀） |
-| | | | `--value` | `true`、`false`（默认） |
-| | | | `--limit` | 整数（默认 `10`，已下推到 etcd server 作为 Range limit） |
-| **unmarshal** | Proto 反序列化 | 只读 | `--target-key` | 字符串（etcd 完整 key） |
-| | | | `--import-path` | 字符串，可指定多个 |
-| | | | `--proto` | 字符串（.proto 文件路径），可指定多个 |
-| | | | `--full-message-name` | 字符串（`包名.消息名`） |
-| **leader** | 查询 leader 节点 | 只读 | 无 | — |
-| **decode** | Base64 解码 | 纯本地 | `--value` | 字符串（base64 编码值） |
-| **clear** | 清空所有数据 | 🔴 写操作（已禁用） | 无 | — |
-| **rename** | 重命名 key | 🟠 写操作（已禁用） | `--source-key` | 字符串（原 key） |
-| | | | `--target-key` | 字符串（新 key） |
-| | | | `--bak` | `true`（默认）、`false` |
-| **completion** | Shell 自动补全 | 纯本地 | 子命令 | `bash`、`zsh`、`fish`、`powershell` |
+| Command | Purpose | Type | Flag | Values |
+|---------|---------|------|------|--------|
+| **distribute** | Data size distribution | Read-only | `--type` | `key` (default), `value`, `kv` |
+| | | | `--bucket` | int (default `5`) |
+| | | | `--write-out` | `text` (default), `json` |
+| | | | `--prefix` | string (server-side prefix scan) |
+| | | | `--page-size` | int (default `1000`, keys per page) |
+| | | | `--page-sleep` | duration (default `0`, e.g. `50ms`) |
+| **look** | View/export all data | Read-only | `--show-value` | `true`, `false` (default) |
+| | | | `--write-out` | `stdout` (default), **`jsonl` (recommended, structured)**, `file`, `log` (log ingestion, not for offline analysis) |
+| | | | `--output` | file path (for `file`/`log`/`jsonl`) |
+| | | | `--snapshot` | snapshot db file (offline single-pass all fields, includes rev_count/tombstone_count) |
+| | | | `--hang` | `true`, `false` (default) |
+| | | | `--hang-interval` | int, seconds (default `2`) |
+| | | | `--filter` | `none` (default), `key`, `value`, `kv` (client-side filter) |
+| | | | `--filter-min` | int, bytes (default `-1` = unbounded) |
+| | | | `--filter-max` | int, bytes (default `-1` = unbounded) |
+| | | | `--keys-only` | `true`, `false` (default); fetch key metadata only, no value |
+| | | | `--prefix` | string (server-side prefix scan) |
+| | | | `--page-size` | int (default `1000`) |
+| | | | `--page-sleep` | duration (default `0`, e.g. `50ms`) |
+| **summary** | Aggregate Top N by prefix | Read-only | `--input` | JSONL snapshot file (offline; empty = online scan) |
+| | | | `--keys-only` | `true`, `false` (default, online only, no value) |
+| | | | `--prefix` | string (online only, server-side prefix) |
+| | | | `--group-depth` | int (default `2`, group by first N path segments) |
+| | | | `--strip-suffix` | string (default empty = off; e.g. `.` strips trailing `.<uid>` from last segment before grouping) |
+| | | | `--top` | int (default `20`) |
+| | | | `--sort` | `count` (default), `total-size`, `avg-size`, `max-size`, `max-version`, `latest-mod-revision`, `created-count`, `modified-count`, `distinct-lease-count`, `rev-count`, `tombstone-count` |
+| | | | `--min-create-revision` / `--max-create-revision` | int64 (default `0` = unbounded) |
+| | | | `--min-mod-revision` / `--max-mod-revision` | int64 (default `0` = unbounded) |
+| | | | `--filter` / `--filter-min` / `--filter-max` | client-side filter (default `none` / `-1` / `-1`) |
+| | | | `--page-size` / `--page-sleep` | online only |
+| | | | `--write-out` | `text` (default), `json` |
+| | | | `--output` | file path (default stdout) |
+| **find** | Search keys by keyword | Read-only | `--match-key` | string (fuzzy match) |
+| | | | `--prefix` | string (key prefix) |
+| | | | `--value` | `true`, `false` (default) |
+| | | | `--limit` | int (default `10`, pushed down to etcd server as Range limit) |
+| **wal-look** | Export WAL operation stream | Offline read-only | `--data-dir` | etcd data dir (with `member/wal`) or WAL dir (with `*.wal`) (required) |
+| | | | `--write-out` | `stdout` (default), **`jsonl` (recommended)**, `log` (log ingestion) |
+| | | | `--output` | file path |
+| | | | `--start-index` | uint64 (default `0`, inclusive) |
+| | | | `--end-index` | uint64 (default max, exclusive) |
+| | | | `--entry-type` | comma-separated, 17 types (`IRRPut,IRRDeleteRange,...`; `-h` lists all) |
+| **wal-summary** | Aggregate WAL writes by key | Offline read-only | `--input` | WalOp JSONL file (offline); empty = parse WAL directly |
+| | | | `--data-dir` | etcd data dir or WAL dir (required when `--input` is empty) |
+| | | | `--sort` | `put-count` (default), `delete-count`, `total-ops` |
+| | | | `--top` | int (default `20`) |
+| | | | `--write-out` | `text` (default), `json` |
+| | | | `--output` | file path (default stdout) |
+| **dump** | Raw data export | Offline read-only | subcommand | `list-bucket`, `iterate-bucket`, `scan-keys`, `wal` |
+| | | | `--snapshot` | snapshot db path (required for db subcommands) |
+| | | | `--data-dir` | etcd data dir or WAL dir (required for `wal` subcommand) |
+| | | | `--start-index` / `--end-index` | raft index range (`wal` subcommand) |
+| | | | `--entry-type` | comma-separated, 17 types (`wal` subcommand) |
+| | | | `--start-revision` / `--end-revision` | revision range (`scan-keys`) |
+| | | | `--decode` / `--limit` | decode as KeyValue / cap entries (`iterate-bucket`) |
+| **unmarshal** | Protobuf unmarshal | Read-only | `--target-key` | string (full etcd key) |
+| | | | `--import-path` | string, repeatable |
+| | | | `--proto` | string (.proto file path), repeatable |
+| | | | `--full-message-name` | string (`package.MessageName`) |
+| **leader** | Query leader node | Read-only | none | — |
+| **decode** | Base64 decode | Local only | `--value` | string (base64-encoded value) |
+| **clear** | Clear all data | 🔴 Write (disabled) | none | — |
+| **rename** | Rename a key | 🟠 Write (disabled) | `--source-key` | string (original key) |
+| | | | `--target-key` | string (new key) |
+| | | | `--bak` | `true` (default), `false` |
+| **completion** | Shell completion | Local only | subcommand | `bash`, `zsh`, `fish`, `powershell` |
 
-## 全局 flag（所有命令共享）
+## Global Flags (shared by all commands)
 
-| flag | 默认值 | 可选参数 | 说明 |
-|------|--------|---------|------|
-| `--endpoints` | `127.0.0.1:2379` | 逗号分隔的地址列表 | etcd 集群地址；排查生产建议只传一个 follower |
-| `--cert` | 空 | 文件路径 | TLS 客户端证书文件 |
-| `--key` | 空 | 文件路径 | TLS 客户端私钥文件 |
-| `--cacert` | 空 | 文件路径 | TLS CA 证书文件 |
-| `--command-timeout` | `5` | 整数，单位秒 | 操作超时时间 |
+| Flag | Default | Values | Description |
+|------|---------|--------|-------------|
+| `--endpoints` | `127.0.0.1:2379` | comma-separated addresses | etcd cluster address; for production troubleshooting, pass a single follower |
+| `--cert` | empty | file path | TLS client cert file |
+| `--key` | empty | file path | TLS client key file |
+| `--cacert` | empty | file path | TLS CA file |
+| `--command-timeout` | `5` | int, seconds | operation timeout |
 
-> ⚠️ **TLS 证书验证现状：** 当前只要配置了 `--cert`/`--key`/`--cacert`，就会无条件设置 `InsecureSkipVerify=true`（跳过服务端证书验证）。自签证书场景下可用，但存在中间人风险。后续计划改为显式 `--insecure-skip-tls-verify` flag（默认严格验证），目前尚未落地。
+> ⚠️ **TLS verification status:** Currently, configuring any of `--cert`/`--key`/`--cacert` unconditionally sets `InsecureSkipVerify=true` (skips server cert verification). Works for self-signed certs but has MITM risk. A future explicit `--insecure-skip-tls-verify` flag (strict by default) is planned but not yet implemented.
 
-## 使用示例
+## Examples
 
 ### distribute
 
 ```bash
-# 按 key 大小分布（默认）
+# Distribution by key size (default, text output)
 etcdctl+ distribute
 
-# 按 value 大小分布，8 个桶
+# By value size, 8 buckets
 etcdctl+ distribute --type=value --bucket=8
 
-# 按 key+value 合计大小分布
+# By key+value combined size
 etcdctl+ distribute --type=kv
 
-# 只扫某个前缀（server-side，不全量扫）
+# Scan a prefix only (server-side, not full scan)
 etcdctl+ distribute --prefix=/registry/events --type=value
 
-# JSON 格式输出（方便程序调用）
+# JSON output (structured, for programs / jq; distribute supports text/json only)
 etcdctl+ distribute --type=value --write-out=json
-
-# JSON 配合 jq 查询
 etcdctl+ distribute --type=value --write-out=json | jq '.summary.largest_bytes'
 
-# 生产稳妥扫描：调大 page、页间 sleep
+# JSON to file for program consumption (distribute has no jsonl mode; json is the structured output)
+etcdctl+ distribute --type=kv --write-out=json --output=distribute.json
+
+# Production-safe scan: larger page, sleep between pages
 etcdctl+ distribute --type=kv --page-size=5000 --page-sleep=50ms
 ```
 
 ### look
 
 ```bash
-# 终端查看（默认不显示 value）
-etcdctl+ look
+# Export all data as JSONL (recommended: best performance, structured, consumable by summary/find/distribute offline)
+etcdctl+ look --write-out=jsonl --output=keys.jsonl
 
-# 显示 value
-etcdctl+ look --show-value
-
-# 导出到文件
-etcdctl+ look --write-out=file
-
-# 持续监听，每 5 秒刷新
-etcdctl+ look --write-out=file --hang=true --hang-interval=5
-
-# 只看 key 大小在 74~100 字节之间的数据（客户端过滤，仍会拉 value）
-etcdctl+ look --filter=key --filter-min=74 --filter-max=100
-
-# 日志格式输出（适合 loki）,"log" 和 "file" 均是文件写入
-etcdctl+ look --write-out=log
-
-# 只扫某个前缀（server-side）
-etcdctl+ look --prefix=/registry/events --write-out=log
-
-# keys-only：只拉 key metadata，不拉 value（低风险快照）
-etcdctl+ look --keys-only --write-out=log
-
-# 导出 keys-only JSONL 快照，供 summary --input 离线反复分析
+# keys-only JSONL snapshot: fetch key metadata only, no value transfer — lowest risk
 etcdctl+ look --keys-only --write-out=jsonl --output=keys.jsonl
 
-# 导出某前缀的 full metadata JSONL（含 value size，不含 value 内容）
+# Full-field JSONL for a prefix (includes value size, not value content)
 etcdctl+ look --prefix=/registry/events --write-out=jsonl --output=events-kv-meta.jsonl
 
-# 配合管道
+# Offline snapshot db, single-pass all fields (rev_count/tombstone_count, no etcd connection)
+etcdctl+ look --snapshot=snapshot.db --write-out=jsonl --output=keys.jsonl
+
+# Terminal view (default stdout, no file; prefer jsonl to disk for large datasets)
+etcdctl+ look
+etcdctl+ look --show-value                  # show value (base64)
+etcdctl+ look | more                        # pipe to pager
+
+# Watch with 5s refresh (file mode only)
+etcdctl+ look --write-out=file --hang=true --hang-interval=5
+
+# Client-side filter: key size in 74~100 bytes (still fetches value; does not reduce server load)
+etcdctl+ look --filter=key --filter-min=74 --filter-max=100
+
+# Other output formats (not preferred for offline analysis):
+#   --write-out=log   log format, for ingestion by loki etc.; unstructured, not consumable by summary --input
+#   --write-out=file  plain text to file; for structured analysis use jsonl
+etcdctl+ look --keys-only --write-out=log --output=keys.log
+
+# Pipe
 etcdctl+ look | more
 ```
 
-> ⚠️ **性能提示：** look 默认会全量读取 etcd 所有数据（含 value）。生产环境优先用 `--keys-only`（不拉 value）+ `--prefix`（限定范围）；必须看 value 时再低峰期执行。`--filter` 是客户端过滤，不减少 server 返回量。
+> ⚠️ **Performance note:** look reads all etcd data (including value) by default. For production, prefer `--keys-only --write-out=jsonl` (no value transfer + structured to disk), then analyze offline repeatedly with `summary --input=keys.jsonl`; use `--prefix` to bound scope; fetch value only during off-peak when necessary. `--filter` is client-side and does not reduce server load. `--write-out=log/file` is for log/text scenarios — unstructured, not consumable by offline commands; use `jsonl` for analysis.
 
-**look log/jsonl 输出字段（拆分 size 后）：**
+**look log/jsonl output fields (after splitting size):**
 
 ```text
-# 完整模式（含 value）
+# Full mode (with value)
 key=... value=- key_size_bytes=33 value_size_bytes=10240 kv_size_bytes=10273 kv_size_human=10.1KiB create_revision=... mod_revision=... version=... lease=...
 
-# keys-only 模式（省略 value 相关字段）
+# keys-only mode (value-related fields omitted)
 key=... key_size_bytes=33 create_revision=... mod_revision=... version=... lease=...
 ```
 
-`--keys-only` 组合规则：`--keys-only --filter=value|kv` 不允许（无 value 无法计算）；`--keys-only --show-value` 不允许（语义冲突）。
+`--keys-only` combination rules: `--keys-only --filter=value|kv` is disallowed (no value to compute); `--keys-only --show-value` is disallowed (semantic conflict).
 
 ### summary
 
-按 key 前缀聚合，输出 Top N 分组。支持在线扫描和离线（`--input` 读 JSONL 快照）两种模式。
+Aggregate keys by prefix into Top N groups. Supports online scan and offline (`--input` reads a JSONL snapshot) modes.
 
 ```bash
-# 在线便捷模式：只拉 key metadata，按前缀聚合 key 数最多的 Top 50
+# Online convenience: keys-only, top prefixes by key count
 etcdctl+ summary --keys-only --group-depth=2 --sort=count --top=50
 
-# 离线模式：基于 look 导出的 keys-only 快照反复分析，不访问 etcd
+# Offline: analyze a keys-only snapshot repeatedly without touching etcd
 etcdctl+ summary --input=keys.jsonl --group-depth=2 --sort=count --top=50
 
-# 高频覆盖写热点前缀（version 最高）
+# High-frequency overwrite hotspots (highest version)
 etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=max-version --top=50
 
-# 某时间点后修改最多的前缀（revision 来自 Grafana）
+# Most-modified prefixes after a point (revision from Grafana)
 etcdctl+ summary --input=keys.jsonl --min-mod-revision=38770000000 --group-depth=3 --sort=count --top=50
 
-# 某时间点后新增最多的前缀
+# Most-created prefixes after a point
 etcdctl+ summary --input=keys.jsonl --min-create-revision=38770000000 --group-depth=3 --sort=count --top=50
 
-# 可疑前缀的空间占用（需要含 value size 的快照）
+# Space usage of suspicious prefixes (needs a snapshot with value size)
 etcdctl+ summary --input=events-kv-meta.jsonl --group-depth=3 --sort=total-size --top=50
 
-# 在线模式带客户端过滤 + 稳妥扫描
+# Online with client-side filter + safe scan
 etcdctl+ summary --keys-only --filter=key --filter-min=100 --page-size=1000 --page-sleep=50ms
 
-# JSON 输出便于程序处理
+# JSON output for programs (summary supports text/json only, no jsonl mode)
 etcdctl+ summary --input=keys.jsonl --sort=count --write-out=json --output=summary.json
 
-# K8s <name>.<uid> 类 key 按 <name> 聚合（events/services/endpoints…）
-# --strip-suffix=. 只剥最后一段路径里的 .<uid>，中间段（如 monitoring.coreos.com）不动
+# K8s <name>.<uid> keys aggregated by <name> (events/services/endpoints...)
+# --strip-suffix=. strips the trailing .<uid> from the last segment; middle segments (e.g. monitoring.coreos.com) are untouched
 etcdctl+ summary --input=keys.jsonl --prefix=/registry/events/kyuubi \
     --strip-suffix=. --group-depth=4 --sort=count --top=10
 
-# 按 lease 种类数排序：定位哪些前缀挂的 lease 最杂
+# Rank by lease diversity: which prefixes carry the most varied leases
 etcdctl+ summary --input=keys.jsonl --group-depth=3 --sort=distinct-lease-count --top=10
 ```
 
-**`--group-depth` 分组规则**（以 `/registry/pods/default/nginx` 为例）：
+**`--group-depth` grouping** (example: `/registry/pods/default/nginx`):
 
-| depth | 分组前缀 |
+| depth | group prefix |
 |---|---|
 | 1 | `/registry` |
 | 2 | `/registry/pods` |
 | 3 | `/registry/pods/default` |
 | 4 | `/registry/pods/default/nginx` |
 
-K8s 场景建议：`--group-depth=2` 看资源类型，`--group-depth=3` 看资源类型 + namespace。
+K8s guidance: `--group-depth=2` for resource type, `--group-depth=3` for resource type + namespace.
 
-**`--sort` 取值：**
+**`--sort` values:**
 
-| sort | 用途 |
+| sort | purpose |
 |---|---|
-| `count` | key 数最多的前缀 |
-| `total-size` / `avg-size` / `max-size` | 占用空间最大 / 平均对象大 / 单个大对象（需含 value 的快照） |
-| `max-version` | 高频覆盖写热点前缀 |
-| `latest-mod-revision` | 最近活跃修改的前缀 |
-| `created-count` / `modified-count` | 配合 `--min-*-revision` 找某 revision 后新增/修改最多的前缀 |
-| `distinct-lease-count` | 组内不同 lease id 数最多的前缀（lease 种类最杂） |
-| `rev-count` | 历史 revision 数最多的前缀（仅离线 snapshot JSONL） |
-| `tombstone-count` | tombstone 数最多的前缀（仅离线 snapshot JSONL） |
+| `count` | prefixes with the most keys |
+| `total-size` / `avg-size` / `max-size` | largest total / avg object / single object (needs value-bearing snapshot) |
+| `max-version` | high-frequency overwrite hotspots |
+| `latest-mod-revision` | most recently active prefixes |
+| `created-count` / `modified-count` | with `--min-*-revision`, prefixes most created/modified after a revision |
+| `distinct-lease-count` | prefixes with the most distinct lease ids (most varied leases) |
+| `rev-count` | prefixes with the most historical revisions (offline snapshot JSONL only) |
+| `tombstone-count` | prefixes with the most tombstones (offline snapshot JSONL only) |
 
-**lease 三列**（常驻显示，与 `distribute` 的 `lease==0 = persistent` 语义一致）：
+**Lease columns** (always shown; consistent with `distribute`'s `lease==0 = persistent`):
 
-| 列 | 含义 |
+| column | meaning |
 |---|---|
-| `key_leased_count` | 组内挂 lease（非零）的 key 数；可加，others 行求和 |
-| `distinct_lease_count` | 组内不同 lease id 数（去重）；不可加，others 行显示 `-` |
-| `max_lease` | 组内最大 lease id（真实可 `etcdctl lease inspect` 的 id）；不可加，others 行显示 `-` |
+| `key_leased_count` | keys with a non-zero lease in the group (additive; summed in `others` row) |
+| `distinct_lease_count` | number of distinct lease ids (non-additive; `-` in `others`) |
+| `max_lease` | largest lease id, a real `etcdctl lease inspect`-able id (non-additive; `-` in `others`) |
 
-`key_leased_count / distinct_lease_count` 即 lease 复用度：≈1 → 每个 key 独占 lease；>>1 → 少量 lease 被大量 key 共用。
+`key_leased_count / distinct_lease_count` is the lease-reuse factor: ≈1 → each key has its own lease; >>1 → few leases shared by many keys.
 
-**输出示例（text）：**
+**Text output example:**
 
 ```text
 Summary: 2090000 keys, 15 groups (top 15 by count)
@@ -224,30 +243,145 @@ prefix | count | total_size | avg_size | max_size | max_version | latest_mod_rev
 ...
 ```
 
-> keys-only 快照没有 value size，`total_size`/`avg_size`/`max_size` 显示 `-`；`rev_count`/`tombstone_count` 仅离线 snapshot JSONL 有值（在线/普通 keys-only 快照这两列不显示）。
+> keys-only snapshots have no value size, so `total_size`/`avg_size`/`max_size` show `-`; `rev_count`/`tombstone_count` appear only in offline snapshot JSONL (online / plain keys-only snapshots omit these columns).
 
-keys-only 快照没有 value size，`TotalSize`/`AvgSize`/`MaxSize` 显示 `-`；用 `look --prefix=... --write-out=jsonl`（不带 `--keys-only`）导出的快照才有 size 列。
+keys-only snapshots have no value size, so `TotalSize`/`AvgSize`/`MaxSize` show `-`; use `look --prefix=... --write-out=jsonl` (without `--keys-only`) to export a snapshot with size columns.
 
 ### find
 
 ```bash
-# 搜索包含 "index" 的 key
+# Search keys containing "index"
 etcdctl+ find --match-key=index
 
-# 按前缀搜索
+# By prefix
 etcdctl+ find --prefix=/registry/pods
 
-# 搜索并显示 value
+# Search and show value
 etcdctl+ find --match-key=index --value
 
-# 限制返回数量（已下推到 etcd server，大 prefix 也安全）
+# Limit returned count (pushed down to etcd server; safe even for large prefixes)
 etcdctl+ find --match-key=index --limit=50
+```
+
+### wal-look
+
+Parse WAL from an etcd data directory and export the operation stream. **Read-only, no flock — safe to run directly on production `member/wal`** (same mechanism as the official `etcd-dump-logs`; does not block the cluster or corrupt data).
+
+```bash
+# Export WAL operations as JSONL (recommended: structured, consumable by wal-summary --input)
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=jsonl --output=wal.jsonl
+
+# --data-dir accepts both: an etcd data dir (with member/wal) or a WAL dir (with *.wal) directly
+etcdctl+ wal-look --data-dir=/var/lib/etcd/member/wal --write-out=jsonl --output=wal.jsonl
+
+# Operations in an index range only
+etcdctl+ wal-look --data-dir=/var/lib/etcd --start-index=930 --end-index=1000 \
+    --write-out=jsonl --output=wal-range.jsonl
+
+# Filter by entry type (--entry-type supports all 17 types; see table below; -h lists all)
+etcdctl+ wal-look --data-dir=/var/lib/etcd --entry-type=IRRPut,IRRDeleteRange \
+    --write-out=jsonl --output=wal-writes.jsonl
+
+# Terminal view (default stdout)
+etcdctl+ wal-look --data-dir=/var/lib/etcd
+
+# Other output formats (not preferred for offline analysis):
+#   --write-out=log  log format, for ingestion by loki etc.; unstructured, not consumable by wal-summary --input
+etcdctl+ wal-look --data-dir=/var/lib/etcd --write-out=log --output=wal.log
+```
+
+JSONL output (one WalOp per line; ops without key/value such as Compaction omit those fields):
+
+```json
+{"raft_index":10864,"raft_term":3,"op_type":"Put","key":".monitor","value_size_bytes":17,"entry_type":"IRRPut"}
+{"raft_index":10865,"raft_term":3,"op_type":"Compaction","entry_type":"IRRCompaction"}
+{"raft_index":10866,"raft_term":3,"op_type":"DeleteRange","key":"/old","entry_type":"IRRDeleteRange"}
+```
+
+**`op_type` ↔ `entry_type` mapping** (also listed by `-h`):
+
+| op_type | entry_type | notes |
+|---|---|---|
+| Range | IRRRange | read; not normally in WAL — its presence is anomalous |
+| Put | IRRPut | write / overwrite |
+| DeleteRange | IRRDeleteRange | range delete |
+| Txn | IRRTxn | txn parent record; sub-ops keep entry_type IRRTxn, is_txn=true |
+| Compaction | IRRCompaction | compaction; tiny payload in WAL |
+| LeaseGrant | IRRLeaseGrant | grant lease |
+| LeaseRevoke | IRRLeaseRevoke | revoke lease |
+| LeaseCheckpoint | IRRLeaseCheckpoint | lease checkpoint (KeepAlive is not written to WAL) |
+| AuthEnable | IRRAuthEnable | enable auth |
+| AuthDisable | IRRAuthDisable | disable auth |
+| AuthUser | IRRAuthUser | user add/delete / password / grant |
+| AuthRole | IRRAuthRole | role add/delete / grant |
+
+Plus 5 fallback types: `IRRUnknown`, `ConfigChange`, `Normal`, `Request`, `Unknown`.
+
+> 💡 **WAL write-pressure attribution:** Put + DeleteRange (including Txn sub-ops) dominate WAL volume; other types together are typically <5%. Txn sub-ops have `op_type` Put/DeleteRange and are already counted in wal-summary's PutCount/DeleteCount — no undercounting.
+
+### wal-summary
+
+Aggregate WAL write counts per key, from a WalOp JSONL or by parsing WAL directly. **Answers "which key is written most".**
+
+```bash
+# Offline (recommended): analyze JSONL exported by wal-look repeatedly without re-parsing WAL
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --top=50
+
+# Parse WAL directly (one step, but re-parses each time; fine for small clusters or one-off checks)
+etcdctl+ wal-summary --data-dir=/var/lib/etcd --sort=put-count --top=50
+
+# Delete hotspots
+etcdctl+ wal-summary --input=wal.jsonl --sort=delete-count --top=50
+
+# By total ops
+etcdctl+ wal-summary --input=wal.jsonl --sort=total-ops --top=50
+
+# JSON output for programs (wal-summary supports text/json only)
+etcdctl+ wal-summary --input=wal.jsonl --sort=put-count --write-out=json --output=wal-summary.json
+```
+
+Text output prints an **entry-type distribution table** above the Top N by default (covers all 17 types; answers "operation-type distribution"):
+
+```text
+Entry-Type Distribution (17000 total ops):
+  IRRPut             12000
+  IRRDeleteRange       800
+  IRRTxn               150  (parent; sub-ops already counted in IRRPut/IRRDeleteRange)
+  IRRCompaction         12
+  IRRLeaseGrant        ...
+
+WAL Summary: 17000 total ops, 3500 unique keys (top 50 by put-count)
+
+Key                                                            PutCount  DeleteCount     TotalValueSize
+.monitor                                                          12000            0            204.0KiB
+/registry/pods/default/nginx-deploy-abc                           2500           50             40.0MiB
+...
+```
+
+`--sort`: `put-count` (default) / `delete-count` / `total-ops`.
+
+### dump
+
+Export raw entries from a snapshot db or WAL (plain text, aligned with `etcd-dump-db`/`etcd-dump-logs`; does not use the JSONL pipeline).
+
+```bash
+# db: list buckets
+etcdctl+ dump list-bucket --snapshot=snapshot.db
+
+# db: iterate bucket entries (--decode as mvccpb.KeyValue, --limit caps entries)
+etcdctl+ dump iterate-bucket --snapshot=snapshot.db key --decode --limit=100
+
+# db: scan by revision range
+etcdctl+ dump scan-keys --snapshot=snapshot.db --start-revision=100 --end-revision=200 --limit=50
+
+# WAL: raw entries (--entry-type same as wal-look, all 17 types; -h lists all)
+etcdctl+ dump wal --data-dir=/var/lib/etcd --entry-type=IRRPut --start-index=930 --end-index=932
 ```
 
 ### unmarshal
 
 ```bash
-# 解码 etcd 中的 protobuf 数据
+# Decode protobuf data in etcd
 etcdctl+ unmarshal \
   --target-key /registry/pods/default/my-pod \
   --import-path /path/to/proto/dir \
@@ -264,14 +398,14 @@ etcdctl+ leader
 ### decode
 
 ```bash
-# 解码 base64 值（纯本地操作，不连接 etcd）
+# Decode a base64 value (local only, no etcd connection)
 etcdctl+ decode --value="aGVsbG8gd29ybGQ="
 ```
 
-### TLS 连接示例
+### TLS example
 
 ```bash
-# 所有命令都支持全局 TLS 参数
+# All commands accept the global TLS flags
 etcdctl+ \
   --endpoints=https://etcd.example.com:2379 \
   --cert=/path/to/client.pem \
