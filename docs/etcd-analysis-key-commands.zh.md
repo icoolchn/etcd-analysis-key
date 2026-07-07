@@ -405,11 +405,18 @@ etcdctl+ decode --value="aGVsbG8gd29ybGQ="
 ### TLS 连接示例
 
 ```bash
-# 所有命令都支持全局 TLS 参数
+# 所有命令都支持全局 TLS 参数,在线模式
 etcdctl+ \
   --endpoints=https://etcd.example.com:2379 \
   --cert=/path/to/client.pem \
   --key=/path/to/client-key.pem \
   --cacert=/path/to/ca.pem \
-  distribute --type=value
+  distribute --bucket=5
+```
+
+```bash
+# 使用导入的分析文件，离线模式
+./etcdctl+-linux-amd64 \
+  --input=analysis.jsonl \
+  distribute --bucket=5
 ```

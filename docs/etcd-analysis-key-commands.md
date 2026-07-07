@@ -405,11 +405,18 @@ etcdctl+ decode --value="aGVsbG8gd29ybGQ="
 ### TLS example
 
 ```bash
-# All commands accept the global TLS flags
+# All commands accept the global TLS flags,online
 etcdctl+ \
   --endpoints=https://etcd.example.com:2379 \
   --cert=/path/to/client.pem \
   --key=/path/to/client-key.pem \
   --cacert=/path/to/ca.pem \
-  distribute --type=value
+  distribute --bucket=5
+```
+
+```bash
+# input look for jsonl, offline
+./etcdctl+-linux-amd64 \
+  --input=analysis.jsonl \
+  distribute --bucket=5
 ```
