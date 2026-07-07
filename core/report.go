@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/tabwriter"
 	"time"
 
 	"github.com/gosuri/uilive"
@@ -36,6 +37,10 @@ type Report interface {
 	Run() <-chan string
 	DynamicOutput()
 	JSON() string
+	// String returns the full text rendering (Summary + size histogram +
+	// percentiles). Used by distribute's text output to embed the existing
+	// size-distribution block alongside the Overview / Diagnosis sections.
+	String() string
 }
 
 type SizeOf func(*mvccpb.KeyValue) int
@@ -49,6 +54,11 @@ type report struct {
 	processOver atomic.Value
 	dynamicOnce sync.Once
 	jsonMode    bool
+	// silent: when true, text mode does not print finalString to stdout; the
+	// caller retrieves the text via String() and embeds it in a larger layout
+	// (used by distribute to put Overview before Size Distribution per template
+	// 3.1.2). Dynamic output still streams to the uilive writer during Run.
+	silent bool
 }
 
 func (r *report) Results() chan<- []*mvccpb.KeyValue { return r.results }
@@ -70,7 +80,9 @@ func (r *report) Run() <-chan string {
 			if r.stats.Count <= 0 {
 				_, _ = fmt.Fprintln(r.writer, "empty data")
 			}
-			r.finalString()
+			if !r.silent {
+				r.finalString()
+			}
 			r.writer.Stop()
 		}()
 	}
@@ -119,13 +131,12 @@ func (r *report) String() string {
 	// hold the lock, not just the sizes/sizeToCount section. histogram() and
 	// PrintPercent rely on the caller holding the lock; keeping them inside is
 	// unchanged semantics.
+	//
+	// The Summary header (Count/Total/Smallest/Largest/Average) is intentionally
+	// omitted: distribute's Overview already shows total/avg/min/max/p50/p99,
+	// so repeating them here is noise. Only the histogram + percentile table
+	// remain, which is what the Size Distribution section is for.
 	r.stats.countLock.Lock()
-	buffer.WriteString("Summary:\n")
-	buffer.WriteString(fmt.Sprintf("  Count:\t%d.\n", r.stats.Count))
-	buffer.WriteString(fmt.Sprintf("  Total:\t%s.\n", ReadableSize(r.stats.Total)))
-	buffer.WriteString(fmt.Sprintf("  Smallest:\t%s.\n", ReadableSize(r.stats.Smallest)))
-	buffer.WriteString(fmt.Sprintf("  Largest:\t%s.\n", ReadableSize(r.stats.Largest)))
-	buffer.WriteString(fmt.Sprintf("  Average:\t%s.\n", ReadableSize(r.stats.Average)))
 	sort.Ints(r.stats.sizes)
 	buffer.WriteString(r.histogram())
 	buffer.WriteString(PrintPercent(r.stats.sizes, r.stats.sizeToCount))
@@ -196,13 +207,15 @@ func (r *report) histogram() string {
 	}
 	var buffer bytes.Buffer
 	buffer.WriteString("\nSize histogram:\n")
+	tw := tabwriter.NewWriter(&buffer, 0, 0, 2, ' ', 0)
 	for i := 0; i < len(buckets); i++ {
 		var barLen int
 		if max > 0 {
 			barLen = counts[i] * 40 / max
 		}
-		buffer.WriteString(fmt.Sprintf("  %s [%d]\t|%v\n", ReadableSize(buckets[i]), counts[i], strings.Repeat(barChar, barLen)))
+		fmt.Fprintf(tw, "  %s\t[%s]\t|%v\n", ReadableSize(buckets[i]), FormatThousands(int64(counts[i])), strings.Repeat(barChar, barLen))
 	}
+	tw.Flush()
 	return buffer.String()
 }
 
@@ -213,6 +226,16 @@ type ReportOption func(*report)
 func WithJSONMode() ReportOption {
 	return func(r *report) {
 		r.jsonMode = true
+	}
+}
+
+// WithSilent suppresses the final text print to stdout in text mode, so the
+// caller can retrieve the rendered text via String() and embed it in a larger
+// layout (distribute puts Overview before Size Distribution per template 3.1.2).
+// Dynamic output still streams during Run.
+func WithSilent() ReportOption {
+	return func(r *report) {
+		r.silent = true
 	}
 }
 
