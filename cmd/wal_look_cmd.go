@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"os"
 
@@ -52,6 +51,12 @@ Parse WAL log files and output decoded operations.
 Each raft entry is decoded into one or more WalOp records containing
 raft_index, raft_term, op_type, key, value_size_bytes, and entry_type.
 
+By default the read starts at the newest snapshot's index (only post-snapshot
+entries are returned, matching etcd's own recovery behavior). If no snapshot is
+found, every available WAL segment is read from the oldest. An analysis-scope
+summary (snapshot used, segments read/skipped, estimated time range) is printed
+to stderr before the data.
+
 Use --write-out=jsonl to produce WalOp JSONL for 'wal-summary --input'.
 
 Examples:
@@ -90,22 +95,34 @@ func walLookFunc(cmd *cobra.Command, args []string) {
 		opts = append(opts, core.WithEntryTypeFilter(walEntryType))
 	}
 
-	opc, err := core.WalSource(walDataDir, opts...)
+	opc, scope, err := core.WalSource(walDataDir, opts...)
 	if err != nil {
 		core.Exit(err)
 	}
 
-	var writer io.Writer
+	// Collect into memory first so the scope summary (which includes the last
+	// read index) can be printed before the data. The default post-snapshot read
+	// is small (tens of thousands of entries); full-history reads (no snapshot)
+	// are larger but still manageable for offline analysis.
+	var ops []core.WalOp
+	for op := range opc {
+		ops = append(ops, op)
+	}
+
+	// Print the analysis-scope summary to stderr (does not pollute jsonl stdout
+	// or the --output file). Printed before the data so the user sees context
+	// first.
+	core.PrintWalScope(os.Stderr, scope, len(ops))
+
+	var writer *os.File
 	switch walWriteOut {
 	case "jsonl":
-		f := GetFileWriter(walOutput, "wal.jsonl")
-		defer f.Close()
-		writer = f
+		writer = GetFileWriter(walOutput, "wal.jsonl")
+		defer writer.Close()
 	case "log":
 		if walOutput != "" {
-			f := GetFileWriter(walOutput, "wal.log")
-			defer f.Close()
-			writer = f
+			writer = GetFileWriter(walOutput, "wal.log")
+			defer writer.Close()
 		} else {
 			writer = os.Stdout
 		}
@@ -113,7 +130,7 @@ func walLookFunc(cmd *cobra.Command, args []string) {
 		writer = os.Stdout
 	}
 
-	for op := range opc {
+	for _, op := range ops {
 		switch walWriteOut {
 		case "jsonl":
 			b, _ := json.Marshal(op)
