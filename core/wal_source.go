@@ -3,16 +3,20 @@ package core
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang/protobuf/proto"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/wal"
 	"go.etcd.io/etcd/server/v3/wal/walpb"
 )
@@ -28,13 +32,50 @@ type WalOp struct {
 	EntryType      string `json:"entry_type,omitempty"`
 }
 
+// WalSegmentInfo describes one WAL segment file on disk.
+type WalSegmentInfo struct {
+	Name       string    // file name, e.g. 000000000000008f-0000000004989c51.wal
+	Seq        uint64    // first field of the name
+	FirstIndex uint64    // second field of the name
+	Mtime      time.Time // file modification time = segment's last write
+	IsTail     bool      // true for the highest-seq segment (still being written)
+}
+
+// SnapInfo describes one snapshot file on disk (filename + mtime only; the .snap
+// content is NOT parsed here).
+type SnapInfo struct {
+	Name  string    // file name, e.g. 0000000000002250-00000000049b53a4.snap
+	Term  uint64    // first field of the name
+	Index uint64    // second field of the name
+	Mtime time.Time // file modification time ≈ when the snapshot was taken
+}
+
+// WalScope describes what WalSource actually read: which snapshot was used as
+// the start point, which segments were read vs skipped, and the resulting raft
+// index range. Used to print an analysis-scope summary to the user.
+type WalScope struct {
+	// SnapUsed is the snapshot whose Index was passed to wal.OpenForRead as the
+	// read start. May be empty (no snapshot found) -- then the oldest segment's
+	// firstIndex is used and all segments are read.
+	SnapUsed *SnapInfo
+	// ReadStartIndex is the raft index passed to OpenForRead (snap.Index, or
+	// oldest firstIndex when no snap). Entries with index > ReadStartIndex are
+	// returned by ReadAll.
+	ReadStartIndex uint64
+	// ReadSegments are the WAL segments actually opened and read (from the one
+	// containing ReadStartIndex to the tail).
+	ReadSegments []WalSegmentInfo
+	// SkippedSegments are the WAL segments before ReadStartIndex (not read).
+	SkippedSegments []WalSegmentInfo
+}
+
 // WalOption configures a WalSource call.
 type WalOption func(*walConfig)
 
 type walConfig struct {
-	startIndex  uint64
-	endIndex    uint64
-	entryTypes  map[string]bool
+	startIndex uint64
+	endIndex   uint64
+	entryTypes map[string]bool
 }
 
 // WithStartIndex sets the inclusive start raft index.
@@ -60,14 +101,27 @@ func WithEntryTypeFilter(types string) WalOption {
 	}
 }
 
-func loadNewestSnapshot(dataDir string) walpb.Snapshot {
-	snapDir := filepath.Join(dataDir, "member", "snap")
-	names, err := filepath.Glob(filepath.Join(snapDir, "*.snap"))
-	if err != nil || len(names) == 0 {
+// loadNewestSnapshot reads the newest snapshot under <walPath>/../snap and
+// returns its raft Index/Term. An empty Snapshot is returned when there is no
+// snapshot (e.g. a fresh cluster that has never snapshotted, or only member/wal
+// was copied without member/snap), so the caller falls back to reading from the
+// first WAL segment.
+//
+// The real snapshot index is required because wal.OpenForRead calls searchIndex
+// to land on the segment containing snap.Index. With a zero snapshot index it
+// only matches a first segment named ...-0000000000000000.wal; once that segment
+// is purged after compaction (the common case for a long-running cluster),
+// searchIndex returns ErrFileNotFound ("wal: file not found").
+func loadNewestSnapshot(walPath string) walpb.Snapshot {
+	snapDir := filepath.Join(walPath, "..", "snap")
+	if !isDir(snapDir) {
 		return walpb.Snapshot{}
 	}
-	sort.Strings(names)
-	return walpb.Snapshot{}
+	s, err := snap.New(nil, snapDir).Load()
+	if err != nil || s == nil {
+		return walpb.Snapshot{}
+	}
+	return walpb.Snapshot{Index: s.Metadata.Index, Term: s.Metadata.Term}
 }
 
 // resolveWalDir resolves --data-dir to the actual WAL directory.
@@ -94,22 +148,167 @@ func isDir(p string) bool {
 	return err == nil && info.IsDir()
 }
 
+// listWalSegments scans <walPath>/*.wal and returns segment infos sorted by Seq
+// ascending. The highest-Seq segment is marked IsTail (still being written).
+func listWalSegments(walPath string) []WalSegmentInfo {
+	entries, err := os.ReadDir(walPath)
+	if err != nil {
+		return nil
+	}
+	var segs []WalSegmentInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".wal") {
+			continue
+		}
+		seq, idx, ok := parseWalSnapName(e.Name(), ".wal")
+		if !ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		segs = append(segs, WalSegmentInfo{
+			Name:       e.Name(),
+			Seq:        seq,
+			FirstIndex: idx,
+			Mtime:      info.ModTime(),
+		})
+	}
+	sort.Slice(segs, func(i, j int) bool { return segs[i].Seq < segs[j].Seq })
+	if len(segs) > 0 {
+		segs[len(segs)-1].IsTail = true
+	}
+	return segs
+}
+
+// listSnaps scans <walPath>/../snap/*.snap and returns snap infos sorted by
+// Index ascending. Only filenames and mtimes are read; .snap content is NOT
+// parsed.
+func listSnaps(walPath string) []SnapInfo {
+	snapDir := filepath.Join(walPath, "..", "snap")
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return nil
+	}
+	var snaps []SnapInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".snap") {
+			continue
+		}
+		term, idx, ok := parseWalSnapName(e.Name(), ".snap")
+		if !ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		snaps = append(snaps, SnapInfo{
+			Name:  e.Name(),
+			Term:  term,
+			Index: idx,
+			Mtime: info.ModTime(),
+		})
+	}
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Index < snaps[j].Index })
+	return snaps
+}
+
+// parseWalSnapName parses a "{f0}-{f1}<suffix>" filename (wal or snap) and
+// returns both hex fields as uint64. For wal: f0=seq, f1=firstIndex. For snap:
+// f0=term, f1=index.
+func parseWalSnapName(name, suffix string) (f0, f1 uint64, ok bool) {
+	base := strings.TrimSuffix(name, suffix)
+	parts := strings.SplitN(base, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	a, err := strconv.ParseUint(parts[0], 16, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	b, err := strconv.ParseUint(parts[1], 16, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return a, b, true
+}
+
 // WalSource opens WAL files in the given data directory and streams decoded
-// WalOp entries. Uses wal.OpenForRead + ReadAll.
-func WalSource(dataDir string, opts ...WalOption) (<-chan WalOp, error) {
+// WalOp entries. Uses wal.OpenForRead + ReadAll. The read starts at the newest
+// snapshot's index (only post-snapshot entries are returned, matching etcd's own
+// recovery behavior); if no snapshot is found, it falls back to the oldest
+// segment's firstIndex and reads every segment. The returned WalScope describes
+// what was actually read, for printing an analysis-scope summary.
+//
+// ReadAll is allowed to return wal.ErrSnapshotNotFound (a soft error: entries
+// are still populated) when the start index has no matching snapshot record in
+// the WAL; it is tolerated. Other read errors abort the stream.
+func WalSource(dataDir string, opts ...WalOption) (<-chan WalOp, *WalScope, error) {
 	cfg := &walConfig{endIndex: ^uint64(0)}
 	for _, o := range opts {
 		o(cfg)
 	}
 
-	walsnap := loadNewestSnapshot(dataDir)
 	walPath, err := resolveWalDir(dataDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	scope := &WalScope{}
+	segs := listWalSegments(walPath)
+	snaps := listSnaps(walPath)
+
+	// Read start: newest snapshot's index if available, else oldest segment's
+	// firstIndex (read everything). This mirrors etcd recovery: the snapshot
+	// already archives all entries up to its index, so only post-snap entries
+	// are read from the WAL.
+	walsnap := loadNewestSnapshot(walPath)
+	if walsnap.Index == 0 && len(segs) > 0 {
+		// No snapshot: start from the oldest segment's firstIndex.
+		walsnap = walpb.Snapshot{Index: segs[0].FirstIndex}
+	}
+	scope.ReadStartIndex = walsnap.Index
+	if len(snaps) > 0 {
+		newest := snaps[len(snaps)-1]
+		// SnapUsed is the snapshot whose index matches the read start (the newest
+		// one, since loadNewestSnapshot returns it).
+		for i := range snaps {
+			if snaps[i].Index == walsnap.Index {
+				s := snaps[i]
+				scope.SnapUsed = &s
+				break
+			}
+		}
+		_ = newest
+	}
+
+	// Split segments into read (containing ReadStartIndex .. tail) vs skipped.
+	readStarted := false
+	for i := range segs {
+		if !readStarted {
+			// The first segment whose firstIndex <= ReadStartIndex + (it's the
+			// last such, since segs are sorted by seq and firstIndex increases)
+			// is where OpenForRead's searchIndex lands.
+			if i == len(segs)-1 || segs[i+1].FirstIndex > scope.ReadStartIndex {
+				readStarted = true
+				scope.ReadSegments = append(scope.ReadSegments, segs[i])
+			} else {
+				scope.SkippedSegments = append(scope.SkippedSegments, segs[i])
+			}
+		} else {
+			scope.ReadSegments = append(scope.ReadSegments, segs[i])
+		}
+	}
+
 	w, err := wal.OpenForRead(nil, walPath, walsnap)
 	if err != nil {
-		return nil, fmt.Errorf("open WAL: %w", err)
+		if errors.Is(err, wal.ErrFileNotFound) {
+			return nil, nil, fmt.Errorf("open WAL: %w (cluster may have snapshotted and purged old WAL; "+
+				"ensure member/snap is copied alongside member/wal)", err)
+		}
+		return nil, nil, fmt.Errorf("open WAL: %w", err)
 	}
 
 	c := make(chan WalOp, 100)
@@ -118,7 +317,9 @@ func WalSource(dataDir string, opts ...WalOption) (<-chan WalOp, error) {
 		defer w.Close()
 
 		_, _, ents, readErr := w.ReadAll()
-		if readErr != nil {
+		// ErrSnapshotNotFound is a soft error: the start index has no matching
+		// snapshot record in the WAL, but ents is still populated.
+		if readErr != nil && !errors.Is(readErr, wal.ErrSnapshotNotFound) {
 			return
 		}
 
@@ -136,7 +337,7 @@ func WalSource(dataDir string, opts ...WalOption) (<-chan WalOp, error) {
 		}
 	}()
 
-	return c, nil
+	return c, scope, nil
 }
 
 // decodeEntry decodes a single raft entry into one or more WalOps.
@@ -313,7 +514,7 @@ func decodeTxnOps(index, term uint64, txn *etcdserverpb.TxnRequest) []WalOp {
 
 // CollectWalOps reads all WalOps from WAL files into memory.
 func CollectWalOps(dataDir string, opts ...WalOption) ([]WalOp, error) {
-	opc, err := WalSource(dataDir, opts...)
+	opc, _, err := WalSource(dataDir, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +523,88 @@ func CollectWalOps(dataDir string, opts ...WalOption) ([]WalOp, error) {
 		ops = append(ops, op)
 	}
 	return ops, nil
+}
+
+// CollectWalOpsWithScope is like CollectWalOps but also returns the WalScope
+// describing what was read (used to print an analysis-scope summary).
+func CollectWalOpsWithScope(dataDir string, opts ...WalOption) ([]WalOp, *WalScope, error) {
+	opc, scope, err := WalSource(dataDir, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	var ops []WalOp
+	for op := range opc {
+		ops = append(ops, op)
+	}
+	return ops, scope, nil
+}
+
+// PrintWalScope writes a human-readable summary of what WalSource read to w
+// (usually stderr): the snapshot used as the read start, the WAL segments read
+// vs skipped, and the estimated write-time range. totalOps is the number of ops
+// actually decoded, used for the final summary line.
+//
+// The time range is an estimate: raft entries carry no timestamp, so the lower
+// bound is the snapshot's mtime (≈ when its index was applied) and the upper
+// bound is the tail segment's mtime (last known write). Same-segment entries
+// cannot be distinguished in time.
+func PrintWalScope(w io.Writer, scope *WalScope, totalOps int) {
+	if scope == nil {
+		return
+	}
+	fmt.Fprintln(w, "Analysis scope:")
+	fmt.Fprintln(w)
+
+	if scope.SnapUsed != nil {
+		s := scope.SnapUsed
+		fmt.Fprintf(w, "  Start (newest snapshot): %s  index=%d  term=%d  mtime=%s\n",
+			s.Name, s.Index, s.Term, s.Mtime.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(w, "  (entries with raft_index > %d are read; earlier ones are archived in the snapshot)\n",
+			s.Index)
+	} else {
+		fmt.Fprintf(w, "  Start (no snapshot, oldest segment firstIndex): raft_index > %d\n", scope.ReadStartIndex)
+	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintf(w, "  WAL segments read (%d):\n", len(scope.ReadSegments))
+	for _, seg := range scope.ReadSegments {
+		tail := ""
+		if seg.IsTail {
+			tail = "  (tail, still being written)"
+		}
+		fmt.Fprintf(w, "    %s  firstIndex=%d  lastWrite=%s%s\n",
+			seg.Name, seg.FirstIndex, seg.Mtime.Format("2006-01-02 15:04:05"), tail)
+	}
+	fmt.Fprintln(w)
+
+	if len(scope.SkippedSegments) > 0 {
+		fmt.Fprintf(w, "  WAL segments skipped (%d, before the read start):\n", len(scope.SkippedSegments))
+		for _, seg := range scope.SkippedSegments {
+			fmt.Fprintf(w, "    %s  firstIndex=%d  lastWrite=%s\n",
+				seg.Name, seg.FirstIndex, seg.Mtime.Format("2006-01-02 15:04:05"))
+		}
+		fmt.Fprintln(w)
+	}
+
+	var lowerTime, upperTime string
+	if scope.SnapUsed != nil {
+		lowerTime = scope.SnapUsed.Mtime.Format("2006-01-02 15:04")
+	} else if len(scope.SkippedSegments) > 0 {
+		lowerTime = scope.SkippedSegments[0].Mtime.Format("2006-01-02 15:04")
+	} else if len(scope.ReadSegments) > 0 {
+		lowerTime = scope.ReadSegments[0].Mtime.Format("2006-01-02 15:04")
+	}
+	if len(scope.ReadSegments) > 0 {
+		tail := scope.ReadSegments[len(scope.ReadSegments)-1]
+		upperTime = tail.Mtime.Format("2006-01-02 15:04")
+	}
+	if lowerTime != "" && upperTime != "" {
+		fmt.Fprintf(w, "  Estimated write-time range: %s ~ %s\n", lowerTime, upperTime)
+		fmt.Fprintln(w, "  (raft entries carry no timestamp; inferred from snapshot/wal file mtimes)")
+		fmt.Fprintln(w)
+	}
+
+	fmt.Fprintf(w, "  Total ops parsed: %d\n", totalOps)
 }
 
 // ReadWalJSONL reads a WalOp JSONL file.

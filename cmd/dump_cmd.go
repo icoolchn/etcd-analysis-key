@@ -173,7 +173,7 @@ func newDumpWalCmd() *cobra.Command {
 				opts = append(opts, core.WithEntryTypeFilter(entryType))
 			}
 
-			opc, err := core.WalSource(dataDir, opts...)
+			opc, _, err := core.WalSource(dataDir, opts...)
 			if err != nil {
 				core.Exit(err)
 			}

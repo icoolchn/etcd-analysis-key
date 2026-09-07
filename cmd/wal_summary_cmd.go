@@ -54,18 +54,26 @@ Sort keys: put-count, delete-count, total-ops.
 
 func walSummaryFunc(cmd *cobra.Command, args []string) {
 	var ops []core.WalOp
+	var scope *core.WalScope
 	var err error
 
 	if walSummaryInput != "" {
 		ops, err = core.ReadWalJSONL(walSummaryInput)
 	} else if walSummaryDataDir != "" {
-		ops, err = core.CollectWalOps(walSummaryDataDir)
+		ops, scope, err = core.CollectWalOpsWithScope(walSummaryDataDir)
 	} else {
 		core.Exit(fmt.Errorf("either --input or --data-dir is required"))
 		return
 	}
 	if err != nil {
 		core.Exit(err)
+	}
+
+	// In direct (--data-dir) mode, print the analysis-scope summary to stderr
+	// first so the user knows what range was read. In --input mode the scope is
+	// unknown (jsonl carries no snap/wal metadata), so nothing is printed.
+	if scope != nil {
+		core.PrintWalScope(os.Stderr, scope, len(ops))
 	}
 
 	stats := core.AggregateWalOps(ops)
